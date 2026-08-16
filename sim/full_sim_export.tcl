@@ -32,17 +32,19 @@ set project_root [file normalize "$sim_dir/.."]
 set project_xpr "$project_root/OSVVM_Ethernet_Sim.xpr"
 
 # Precompiled Xilinx libraries for Questa (compile_simlib output).
-# Generation path (already done on this machine, documented in README):
-#   compile_simlib -simulator questa -simulator_exec_path <questa>/bin \
-#       -family artixuplus -library all -dir <target_dir>
-set QUESTA_COMPILED_LIBS \
-    "/media/fpgadev/Dev_Tools/Mentor_Graphics/Questa_Libraries_Vivado_2026.1/Questa_Libraries_Vivado"
+# REQUIRED: the QUESTA_COMPILED_LIB_DIR environment variable must point at
+# the compile_simlib output directory -- no path is baked in here, so the
+# scripts stay portable across machines. Generation command: README 5.4.
+if {![info exists ::env(QUESTA_COMPILED_LIB_DIR)]} {
+    error "full_sim_export.tcl: QUESTA_COMPILED_LIB_DIR is not set.\nPoint it at your compile_simlib output directory (see README 5.4), e.g.:\n  export QUESTA_COMPILED_LIB_DIR=/path/to/Questa_Libraries_Vivado"
+}
+set QUESTA_COMPILED_LIBS $::env(QUESTA_COMPILED_LIB_DIR)
 
 if {![file exists $project_xpr]} {
     error "full_sim_export.tcl: $project_xpr not found - run the Vivado build first (vivado -mode batch -source build_all.tcl)"
 }
 if {![file isdirectory $QUESTA_COMPILED_LIBS]} {
-    error "full_sim_export.tcl: precompiled Questa libraries not found at\n  $QUESTA_COMPILED_LIBS\nGenerate them with compile_simlib (see README)."
+    error "full_sim_export.tcl: precompiled Questa libraries not found at\n  $QUESTA_COMPILED_LIBS (from QUESTA_COMPILED_LIB_DIR)\nGenerate them with compile_simlib (see README 5.4)."
 }
 
 # Reuse the project if this session already has it open (run_sim.tcl

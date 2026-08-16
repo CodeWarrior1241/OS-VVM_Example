@@ -40,6 +40,25 @@ package EthFramePkg is
   -- CRC-32 over Frame, returned as the 4 FCS bytes in wire order
   function CalcFcs ( Frame : ByteArrayType ) return ByteArrayType ;
 
+  ------------------------------------------------------------
+  -- PCAP capture of generated frames (nanosecond libpcap format,
+  -- LINKTYPE_ETHERNET; frames include the FCS so Wireshark can be told to
+  -- validate it and flag the error-injected ones). Written with plain
+  -- VHDL binary file I/O -- works on Questa and XSim alike.
+  ------------------------------------------------------------
+  type ByteFileType is file of character ;
+
+  -- 24-byte global header; call once right after file_open (write_mode
+  -- truncates, so every run produces a fresh capture)
+  procedure PcapWriteGlobalHeader ( file F : ByteFileType ) ;
+
+  -- One packet record stamped with the simulation time
+  procedure PcapWriteFrame (
+    file     F       : ByteFileType ;
+    constant Frame   : in ByteArrayType ;
+    constant TimeNow : in time
+  ) ;
+
 end package EthFramePkg ;
 
 package body EthFramePkg is
@@ -76,5 +95,53 @@ package body EthFramePkg is
     Fcs(3) := Crc(31 downto 24) ;
     return Fcs ;
   end function CalcFcs ;
+
+  -- 32-bit little-endian write (value must be < 2**31; the one constant
+  -- that is not -- the nanosecond-pcap magic -- is written byte by byte)
+  procedure PcapWriteU32 (
+    file     F : ByteFileType ;
+    constant V : in integer
+  ) is
+    variable U : unsigned(31 downto 0) ;
+  begin
+    U := to_unsigned(V, 32) ;
+    write(F, character'val(to_integer(U( 7 downto  0)))) ;
+    write(F, character'val(to_integer(U(15 downto  8)))) ;
+    write(F, character'val(to_integer(U(23 downto 16)))) ;
+    write(F, character'val(to_integer(U(31 downto 24)))) ;
+  end procedure PcapWriteU32 ;
+
+  procedure PcapWriteGlobalHeader ( file F : ByteFileType ) is
+  begin
+    -- magic 0xA1B23C4D (nanosecond pcap), little-endian
+    write(F, character'val(16#4D#)) ;
+    write(F, character'val(16#3C#)) ;
+    write(F, character'val(16#B2#)) ;
+    write(F, character'val(16#A1#)) ;
+    PcapWriteU32(F, 16#00040002#) ;  -- version 2.4 (major, minor as u16 LE)
+    PcapWriteU32(F, 0) ;             -- thiszone
+    PcapWriteU32(F, 0) ;             -- sigfigs
+    PcapWriteU32(F, 65535) ;         -- snaplen
+    PcapWriteU32(F, 1) ;             -- network = LINKTYPE_ETHERNET
+  end procedure PcapWriteGlobalHeader ;
+
+  procedure PcapWriteFrame (
+    file     F       : ByteFileType ;
+    constant Frame   : in ByteArrayType ;
+    constant TimeNow : in time
+  ) is
+    -- 32-bit integer holds ~2.1 s worth of nanoseconds; simulations here
+    -- are milliseconds long
+    variable TotalNs : integer ;
+  begin
+    TotalNs := TimeNow / 1 ns ;
+    PcapWriteU32(F, TotalNs / 1_000_000_000) ;    -- ts_sec
+    PcapWriteU32(F, TotalNs rem 1_000_000_000) ;  -- ts_nsec
+    PcapWriteU32(F, Frame'length) ;               -- incl_len
+    PcapWriteU32(F, Frame'length) ;               -- orig_len
+    for i in Frame'range loop
+      write(F, character'val(to_integer(unsigned(Frame(i))))) ;
+    end loop ;
+  end procedure PcapWriteFrame ;
 
 end package body EthFramePkg ;

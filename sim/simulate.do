@@ -83,6 +83,11 @@ set StdArithNoWarnings 1
 
 if {$DETAILED eq "yes"} {
 
+# Log EVERYTHING (not just the displayed waves) so any signal in the
+# design can be added to the wave window after the run without rerunning.
+# The .wlf grows accordingly -- an accepted cost of detailed mode.
+log -r /*
+
 add wave -divider "Clock & Reset"
 add wave /TbEthernetFifo/Clk
 add wave /TbEthernetFifo/nReset

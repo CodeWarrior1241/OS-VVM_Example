@@ -140,8 +140,18 @@ if [[ "$FULL_SIM" == "yes" ]]; then
     echo "  (GT SecureIP + all IP, bring-up test)"
     echo "=========================================="
 
-    # 1) Vivado-generated compile scripts (regenerate if absent)
+    # 1) Vivado-generated compile scripts (regenerate if absent).
+    # Script export needs QUESTA_COMPILED_LIB_DIR (the compile_simlib
+    # output area) -- fail early with guidance instead of deep in Vivado.
     if [ ! -f "$EXPQ/Top_wrapper_compile.do" ]; then
+        if [ -z "${QUESTA_COMPILED_LIB_DIR:-}" ]; then
+            echo "ERROR: QUESTA_COMPILED_LIB_DIR is not set."
+            echo "  The full-BD flow links against precompiled Xilinx Questa libraries"
+            echo "  (compile_simlib output). Point the variable at that directory:"
+            echo "    export QUESTA_COMPILED_LIB_DIR=/path/to/Questa_Libraries_Vivado"
+            echo "  Generation command and details: README section 5.4."
+            exit 1
+        fi
         VIVADO_BIN="/media/fpgadev/Dev_Tools/Xilinx/2026.1/Vivado/bin/vivado"
         [ -x "$VIVADO_BIN" ] || VIVADO_BIN="$(command -v vivado || true)"
         if [ -z "$VIVADO_BIN" ]; then
@@ -192,10 +202,17 @@ if [[ "$FULL_SIM" == "yes" ]]; then
             "$SIM_DIR/tb/TbFullBd.vhd" \
             "$SIM_DIR/tb/TestCtrl_FullBringup.vhd")
 
-    # 6) Elaborate: reuse the exact -L library list Vivado generated
+    # 6) Elaborate: reuse the exact -L library list Vivado generated.
+    # --detailed elaborates with full visibility (+acc) so every signal in
+    # the BD -- GT SecureIP wrappers included -- can be logged and viewed.
+    if [[ "$DETAILED" == "yes" ]]; then
+        FULL_ACC="+acc"
+    else
+        FULL_ACC="+acc=npr"
+    fi
     LFLAGS="$(grep -o '\-L [A-Za-z0-9_]*' "$EXPQ/Top_wrapper_elaborate.do" | sort -u | tr '\n' ' ')"
     echo "INFO: elaborating TbFullBd (this loads GT SecureIP)..."
-    (cd "$EXPQ" && "$QBIN/vopt" -64 +acc=npr -suppress 10016 \
+    (cd "$EXPQ" && "$QBIN/vopt" -64 $FULL_ACC -suppress 10016 \
         $LFLAGS -L tb_full -work tb_full \
         tb_full.TbFullBd xil_defaultlib.glbl -o TbFullBd_opt \
         > full_bd_elaborate.log 2>&1) || {
@@ -207,9 +224,19 @@ if [[ "$FULL_SIM" == "yes" ]]; then
     # 7) Run. OSVVM's EndOfTestReports appends to OsvvmTemp_<tool>/OsvvmRun.yml
     # and fatals if the file does not exist (it is normally created by the
     # OSVVM scripting environment, which this flow bypasses).
+    # --detailed: log the whole design (large .wlf accepted) and load the
+    # full-BD wave set (AXI4-Lite ports, serial lanes, MDIO) so a GUI run
+    # ends showing the traffic in/out of the UUT.
     mkdir -p "$EXPQ/OsvvmTemp_Questa"
     touch "$EXPQ/OsvvmTemp_Questa/OsvvmRun.yml"
-    SIM_DO="set NumericStdNoWarnings 1; set StdArithNoWarnings 1; run -all"
+    SIM_DO="set NumericStdNoWarnings 1; set StdArithNoWarnings 1"
+    if [[ "$DETAILED" == "yes" ]]; then
+        SIM_DO="$SIM_DO; log -r /*; do $SIM_DIR/full_wave.do"
+    fi
+    SIM_DO="$SIM_DO; run -all"
+    if [[ "$DETAILED" == "yes" ]]; then
+        SIM_DO="$SIM_DO; catch {wave zoom full}"
+    fi
     if [[ "$SIM_MODE" == "batch" ]]; then
         echo "INFO: running (batch)..."
         (cd "$EXPQ" && "$VSIM" -c -t 1ps -suppress 8683 -lib tb_full TbFullBd_opt \

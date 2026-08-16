@@ -203,6 +203,11 @@ begin
   --   Constrained-random frame generation, driven by coverage closure
   ------------------------------------------------------------
   TransmitterProc : process
+    -- Every transmitted frame (FCS included, corrupted ones too) is also
+    -- written to a Wireshark-ready capture, regenerated fresh each run
+    -- (write_mode truncates). Lands in the simulator's working directory.
+    file     PcapFile  : ByteFileType ;
+    constant PCAP_NAME : string := "TbEthernetFifo_FrameLoopback_tx.pcap" ;
     variable RV         : RandomPType ;
     variable Frame      : ByteArrayType(0 to ETH_MAX_JUMBO_FRAME-1) ;
     variable Fcs        : ByteArrayType(0 to ETH_FCS_LEN-1) ;
@@ -227,6 +232,9 @@ begin
     GetAlertLogID(StreamTxRec, TxLogID) ;
     SetLogEnable(TxLogID, INFO, FALSE) ;
     RV.InitSeed(RV'instance_name) ;
+
+    file_open(PcapFile, PCAP_NAME, write_mode) ;
+    PcapWriteGlobalHeader(PcapFile) ;
 
     -- Send constrained-random frames until every coverage model reports
     -- 100% -- the objective "we are done" criterion for this test.
@@ -319,6 +327,7 @@ begin
         Push(SB_Data, Frame(i)) ;
         Push(TxBurstFifo, Frame(i)) ;
       end loop ;
+      PcapWriteFrame(PcapFile, Frame(0 to FrameLen-1), now) ;
 
       SendBurst(StreamTxRec, FrameLen) ;
 
@@ -336,6 +345,10 @@ begin
 
     Log("TransmitterProc: coverage closed after " & to_string(FrameCount) &
         " constrained-random frames", INFO) ;
+
+    file_close(PcapFile) ;
+    Log("TransmitterProc: wrote " & to_string(FrameCount) &
+        " frames to " & PCAP_NAME, INFO) ;
 
     TxDone <= TRUE ;
     WaitForBarrier(TestDone) ;

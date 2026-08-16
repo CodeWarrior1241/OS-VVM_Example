@@ -16,10 +16,13 @@
 #
 #   Optional arguments:
 #     -gui        opens xsim in GUI mode with the AXIS waves
+#     -detailed   with -gui: log EVERY design object to the waveform
+#                 database (large .wdb accepted) so the whole design is
+#                 browsable in the wave viewer after the run
 #     -full_sim   simulates the FULL block design (both Ethernet subsystems
 #                 incl. GT SecureIP) with the bring-up test instead of the
 #                 FIFO-datapath testbench (see README 5.4)
-#        vivado -mode batch -source sim/run_sim.tcl -tclargs -gui
+#        vivado -mode batch -source sim/run_sim.tcl -tclargs -gui -detailed
 #        tclsh sim/run_sim.tcl -full_sim
 #
 # The OSVVM libraries are compiled with OSVVM's own scripting system
@@ -39,10 +42,12 @@ set vivado_gen_dir "$project_root/OSVVM_Ethernet_Sim.gen/sources_1/bd/Top"
 # --- Parse arguments -------------------------------------------------------
 set xsim_gui 0
 set full_sim 0
+set xsim_detailed 0
 if {[info exists ::argv]} {
     foreach arg $::argv {
         if {$arg eq "-gui"} { set xsim_gui 1 }
         if {$arg eq "-full_sim" || $arg eq "--full_sim"} { set full_sim 1 }
+        if {$arg eq "-detailed" || $arg eq "--detailed"} { set xsim_detailed 1 }
     }
 }
 
@@ -179,8 +184,10 @@ if {$full_sim} {
     set largs {}
     foreach name $lflags { lappend largs -L $name }
     puts "run_sim.tcl: elaborating TbFullBd (loads GT SecureIP)..."
+    set full_dbg_args [expr {($xsim_gui || $xsim_detailed) ? [list --debug typical] : [list]}]
     run_tool xelab --incr --relax --mt 8 {*}$largs -L tb_full \
         -timeprecision_vhdl 1ps \
+        {*}$full_dbg_args \
         --snapshot TbFullBd_full tb_full.TbFullBd xil_defaultlib.glbl
 
     # OSVVM's EndOfTestReports appends to OsvvmTemp_<tool>/OsvvmRun.yml and
@@ -193,9 +200,25 @@ if {$full_sim} {
 
     # Run
     if {$xsim_gui} {
+        # GUI: wave set = the observable in/out of the full-BD UUT (the
+        # three AXI4-Lite ports, serial lanes, MDIO); -detailed also logs
+        # every design object (large .wdb accepted)
+        set full_wcfg "$expx/full_xsim_waves.tcl"
+        set fp [open $full_wcfg w]
+        if {$xsim_detailed} {
+            puts $fp {log_wave -recursive *}
+        }
+        puts $fp {add_wave /TbFullBd/SystemResetn /TbFullBd/ClocksLocked /TbFullBd/AxiClk}
+        puts $fp {add_wave /TbFullBd/SgmiiIngressTxP /TbFullBd/SgmiiEgressTxP}
+        puts $fp {add_wave /TbFullBd/MdioIngress /TbFullBd/MdioEgress}
+        puts $fp {add_wave /TbFullBd/IngAwValid /TbFullBd/IngAwAddr /TbFullBd/IngWData /TbFullBd/IngBValid /TbFullBd/IngArValid /TbFullBd/IngArAddr /TbFullBd/IngRData /TbFullBd/IngRValid}
+        puts $fp {add_wave /TbFullBd/EgrAwValid /TbFullBd/EgrAwAddr /TbFullBd/EgrWData /TbFullBd/EgrBValid /TbFullBd/EgrArValid /TbFullBd/EgrArAddr /TbFullBd/EgrRData /TbFullBd/EgrRValid}
+        puts $fp {add_wave /TbFullBd/StsAwValid /TbFullBd/StsAwAddr /TbFullBd/StsWData /TbFullBd/StsArValid /TbFullBd/StsArAddr /TbFullBd/StsRData /TbFullBd/StsRValid}
+        puts $fp {run all}
+        close $fp
         puts "  xsim TbFullBd_full -gui"
-        exec xsim TbFullBd_full -gui &
-        puts "run_sim.tcl: xsim GUI launched (full-BD bring-up test)"
+        exec xsim TbFullBd_full -gui -tclbatch $full_wcfg &
+        puts "run_sim.tcl: xsim GUI launched (full-BD bring-up test, waves loaded)"
     } else {
         set start_ms [clock milliseconds]
         puts "  xsim TbFullBd_full -runall"
@@ -262,9 +285,9 @@ run_tool xvhdl --2008 -work tb_eth "$sim_dir/tb/TestCtrl_FrameLoopback.vhd"
 # 4) Elaborate and run
 # ================================================================================
 
-# GUI runs need debug info in the snapshot so add_wave can reach the
-# frame_stats internals; batch runs stay lean without it
-set dbg_args [expr {$xsim_gui ? [list --debug typical] : [list]}]
+# GUI/detailed runs need debug info in the snapshot so add_wave/log_wave
+# can reach the design internals; batch runs stay lean without it
+set dbg_args [expr {($xsim_gui || $xsim_detailed) ? [list --debug typical] : [list]}]
 run_tool xelab tb_eth.TbEthernetFifo fifo_dut.glbl \
     -L fifo_dut -L xpm -L unisims_ver \
     -timeprecision_vhdl 1ps \
@@ -272,9 +295,15 @@ run_tool xelab tb_eth.TbEthernetFifo fifo_dut.glbl \
     -s TbEthernetFifo_sim
 
 if {$xsim_gui} {
-    # GUI: log the AXIS interface waves and hand control to the user
+    # GUI: log the AXIS interface waves and hand control to the user.
+    # With -detailed, additionally log EVERY object in the design so the
+    # full waveform database is browsable after the run completes (the
+    # .wdb grows accordingly -- an accepted cost of detailed mode).
     set wcfg_do "$xsim_work/xsim_waves.tcl"
     set fp [open $wcfg_do w]
+    if {$xsim_detailed} {
+        puts $fp {log_wave -recursive *}
+    }
     puts $fp {add_wave /TbEthernetFifo/Clk /TbEthernetFifo/nReset}
     puts $fp {add_wave /TbEthernetFifo/SAxisTValid /TbEthernetFifo/SAxisTReady /TbEthernetFifo/SAxisTData /TbEthernetFifo/SAxisTKeep /TbEthernetFifo/SAxisTLast}
     puts $fp {add_wave /TbEthernetFifo/MAxisTValid /TbEthernetFifo/MAxisTReady /TbEthernetFifo/MAxisTData /TbEthernetFifo/MAxisTKeep /TbEthernetFifo/MAxisTLast}
