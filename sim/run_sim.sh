@@ -160,7 +160,8 @@ if [[ "$FULL_SIM" == "yes" ]]; then
             exit 1
         fi
         echo "INFO: exporting full-sim compile scripts (one-time, via Vivado)..."
-        "$VIVADO_BIN" -mode batch -nojournal -nolog -source full_sim_export.tcl
+        # Questa scripts only -- the XSim flow exports its own on demand
+        FULL_SIM_EXPORT_SIMS=questa "$VIVADO_BIN" -mode batch -nojournal -nolog -source full_sim_export.tcl
     fi
 
     # 2) OSVVM libraries (shared cache with the fast flow)
@@ -183,6 +184,23 @@ if [[ "$FULL_SIM" == "yes" ]]; then
     # which already maps every precompiled Xilinx library.
     export MODELSIM="$EXPQ/modelsim.ini"
 
+    # 3b) TB-side PHY partner IP: outside the Top_wrapper hierarchy, so the
+    # Vivado-generated scripts exclude it. Its instance-specific sources
+    # compile here against the same precompiled static libraries.
+    PARTNER_DIR="$PROJ_ROOT/OSVVM_Ethernet_Sim.gen/sources_1/ip/phy_partner_pcs_pma"
+    if [ ! -d "$PARTNER_DIR" ]; then
+        echo "ERROR: PHY-partner IP not found ($PARTNER_DIR) - rebuild the project"
+        exit 1
+    fi
+    echo "INFO: compiling the PHY-partner IP..."
+    (cd "$EXPQ" && "$QBIN/vlog" -64 -incr -work xil_defaultlib \
+        $(find "$PARTNER_DIR/synth" "$PARTNER_DIR/ip_0/synth" -name "*.v" | sort) \
+        > partner_compile.log 2>&1) || {
+        echo "ERROR: PHY-partner compile failed - see $EXPQ/partner_compile.log"
+        tail -20 "$EXPQ/partner_compile.log"
+        exit 1
+    }
+
     # 4) Map the OSVVM libraries into that context
     for lib in defaultlib osvvm osvvm_common osvvm_axi4; do
         d="$(ls -d "$SIM_DIR"/VHDL_LIBS/*/"$lib" 2> /dev/null | head -1)"
@@ -197,10 +215,12 @@ if [[ "$FULL_SIM" == "yes" ]]; then
         && ("$QBIN/vlib" questa_lib/msim/tb_full 2> /dev/null || true) \
         && "$QBIN/vmap" tb_full "$EXPQ/questa_lib/msim/tb_full" > /dev/null \
         && "$QBIN/vcom" -64 -2008 -work tb_full \
+            "$SIM_DIR/tb/EthFramePkg.vhd" \
             "$SIM_DIR/tb/CsrAxiLiteManager.vhd" \
             "$SIM_DIR/tb/TestCtrlFull_e.vhd" \
-            "$SIM_DIR/tb/TbFullBd.vhd" \
-            "$SIM_DIR/tb/TestCtrl_FullBringup.vhd")
+            "$SIM_DIR/tb/TestCtrl_FullBringup.vhd" \
+            "$SIM_DIR/tb/TestCtrl_FullTraffic.vhd" \
+            "$SIM_DIR/tb/TbFullBd.vhd")
 
     # 6) Elaborate: reuse the exact -L library list Vivado generated.
     # --detailed elaborates with full visibility (+acc) so every signal in

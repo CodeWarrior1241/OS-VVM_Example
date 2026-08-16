@@ -5,25 +5,27 @@
 # run_sim.sh (Questa), but on the Vivado simulator (xvhdl/xvlog/xelab/xsim).
 #
 # Usage - any of:
-#   1. From the Vivado TCL console:
+#   1. From the Vivado TCL console (`source` takes no arguments, so set the
+#      options in ::RUN_SIM_ARGS first -- see "Optional arguments" below):
 #        cd {path/to/OS-VVM_Test/sim}
+#        set ::RUN_SIM_ARGS {-gui -full_sim}   ;# omit for the default run
 #        source run_sim.tcl
 #   2. From the Vivado command line (batch):
-#        vivado -mode batch -source sim/run_sim.tcl
+#        vivado -mode batch -source sim/run_sim.tcl -tclargs -full_sim
 #   3. Independently (no Vivado session, xsim tools resolved from the
 #      install or XILINX_VIVADO):
-#        tclsh sim/run_sim.tcl
+#        tclsh sim/run_sim.tcl -full_sim
 #
-#   Optional arguments:
-#     -gui        opens xsim in GUI mode with the AXIS waves
+#   Optional arguments (accepted from ::RUN_SIM_ARGS and from the command
+#   line/-tclargs alike; ::RUN_SIM_ARGS persists for the whole session, so
+#   `unset ::RUN_SIM_ARGS` to go back to a plain default run):
+#     -gui        opens xsim in GUI mode with the waves preloaded
 #     -detailed   with -gui: log EVERY design object to the waveform
 #                 database (large .wdb accepted) so the whole design is
 #                 browsable in the wave viewer after the run
 #     -full_sim   simulates the FULL block design (both Ethernet subsystems
 #                 incl. GT SecureIP) with the bring-up test instead of the
 #                 FIFO-datapath testbench (see README 5.4)
-#        vivado -mode batch -source sim/run_sim.tcl -tclargs -gui -detailed
-#        tclsh sim/run_sim.tcl -full_sim
 #
 # The OSVVM libraries are compiled with OSVVM's own scripting system
 # (StartXSIM.tcl), cached under xsim_work/VHDL_LIBS. All XSim artifacts
@@ -40,15 +42,25 @@ set osvvm_dir "$project_root/deps/OsvvmLibraries"
 set vivado_gen_dir "$project_root/OSVVM_Ethernet_Sim.gen/sources_1/bd/Top"
 
 # --- Parse arguments -------------------------------------------------------
+# Two sources, so every invocation style can pass options:
+#   ::argv          - command line (tclsh) and Vivado -tclargs
+#   ::RUN_SIM_ARGS  - set by the user before `source`, the only way to pass
+#                     options from the interactive Vivado TCL console
 set xsim_gui 0
 set full_sim 0
 set xsim_detailed 0
-if {[info exists ::argv]} {
-    foreach arg $::argv {
-        if {$arg eq "-gui"} { set xsim_gui 1 }
-        if {$arg eq "-full_sim" || $arg eq "--full_sim"} { set full_sim 1 }
-        if {$arg eq "-detailed" || $arg eq "--detailed"} { set xsim_detailed 1 }
+set run_sim_opts {}
+if {[info exists ::RUN_SIM_ARGS]} { set run_sim_opts [concat $run_sim_opts $::RUN_SIM_ARGS] }
+if {[info exists ::argv]}         { set run_sim_opts [concat $run_sim_opts $::argv] }
+foreach arg $run_sim_opts {
+    switch -- $arg {
+        -gui      - --gui      { set xsim_gui 1 }
+        -full_sim - --full_sim { set full_sim 1 }
+        -detailed - --detailed { set xsim_detailed 1 }
     }
+}
+if {[llength $run_sim_opts]} {
+    puts "run_sim.tcl: options: $run_sim_opts"
 }
 
 # --- Make sure the RIGHT xsim tools are reachable --------------------------
@@ -137,6 +149,9 @@ if {$full_sim} {
     # session (TCL console or vivado -mode batch), source it directly --
     # no second Vivado process; under plain tclsh, launch a batch Vivado.
     if {![file exists "$expx/Top_wrapper_vlog.prj"]} {
+        # XSim scripts only: XSim ships its own Xilinx libraries, so this
+        # flow must not require the precompiled Questa ones (5.4).
+        set ::env(FULL_SIM_EXPORT_SIMS) "xsim"
         if {[llength [info commands launch_simulation]]} {
             puts "run_sim.tcl: exporting full-sim compile scripts (in this Vivado session)..."
             source "$sim_dir/full_sim_export.tcl"
@@ -157,6 +172,20 @@ if {$full_sim} {
         error "run_sim.tcl: full-BD compile failed - see $expx/full_bd_compile.log\n$msg"
     }
 
+    # TB-side PHY partner IP: outside the Top_wrapper hierarchy, so the
+    # Vivado-generated scripts exclude it -- compile its instance sources
+    # here (static gig_ethernet_pcs_pma/gtwizard code ships with XSim)
+    set partner_dir "$project_root/OSVVM_Ethernet_Sim.gen/sources_1/ip/phy_partner_pcs_pma"
+    if {![file isdirectory $partner_dir]} {
+        error "run_sim.tcl: PHY-partner IP not found ($partner_dir) - rebuild the project"
+    }
+    puts "run_sim.tcl: compiling the PHY-partner IP..."
+    set partner_srcs [lsort [concat \
+        [glob -nocomplain "$partner_dir/synth/*.v"] \
+        [glob -nocomplain "$partner_dir/synth/*/*.v"] \
+        [glob -nocomplain "$partner_dir/ip_0/synth/*.v"]]]
+    run_tool xvlog --incr --relax -work xil_defaultlib {*}$partner_srcs
+
     # Make the cached OSVVM libraries visible in this xsim.ini context
     set fp [open "$expx/xsim.ini" r] ; set ini [read $fp] ; close $fp
     set additions ""
@@ -169,11 +198,14 @@ if {$full_sim} {
         set fp [open "$expx/xsim.ini" a] ; puts -nonewline $fp $additions ; close $fp
     }
 
-    # Compile the full-BD OSVVM testbench
+    # Compile the full-BD OSVVM testbench (TbFullBd last: it binds the
+    # FullTraffic architecture explicitly)
+    run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/EthFramePkg.vhd"
     run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/CsrAxiLiteManager.vhd"
     run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/TestCtrlFull_e.vhd"
-    run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/TbFullBd.vhd"
     run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/TestCtrl_FullBringup.vhd"
+    run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/TestCtrl_FullTraffic.vhd"
+    run_tool xvhdl --2008 --relax -work tb_full "$sim_dir/tb/TbFullBd.vhd"
 
     # Elaborate with the exact -L library list Vivado generated
     set fp [open "$expx/elaborate.sh" r] ; set etxt [read $fp] ; close $fp
@@ -214,6 +246,8 @@ if {$full_sim} {
         puts $fp {add_wave /TbFullBd/IngAwValid /TbFullBd/IngAwAddr /TbFullBd/IngWData /TbFullBd/IngBValid /TbFullBd/IngArValid /TbFullBd/IngArAddr /TbFullBd/IngRData /TbFullBd/IngRValid}
         puts $fp {add_wave /TbFullBd/EgrAwValid /TbFullBd/EgrAwAddr /TbFullBd/EgrWData /TbFullBd/EgrBValid /TbFullBd/EgrArValid /TbFullBd/EgrArAddr /TbFullBd/EgrRData /TbFullBd/EgrRValid}
         puts $fp {add_wave /TbFullBd/StsAwValid /TbFullBd/StsAwAddr /TbFullBd/StsWData /TbFullBd/StsArValid /TbFullBd/StsArAddr /TbFullBd/StsRData /TbFullBd/StsRValid}
+        puts $fp {add_wave -radix hex /TbFullBd/PartnerGmiiTxd /TbFullBd/PartnerGmiiRxd /TbFullBd/PartnerStatus /TbFullBd/TxcTData}
+        puts $fp {add_wave /TbFullBd/PartnerGmiiTxEn /TbFullBd/PartnerGmiiRxDv /TbFullBd/TxcTValid /TbFullBd/TxcTLast}
         puts $fp {run all}
         close $fp
         puts "  xsim TbFullBd_full -gui"

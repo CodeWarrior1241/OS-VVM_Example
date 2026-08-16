@@ -11,11 +11,17 @@
 --
 --    Board-level wiring provided here:
 --      * 200 MHz differential system clock, 125 MHz differential GT
---        reference clocks (one per MAC, driven from a common source)
+--        reference clocks, 50 MHz independent clock for the PHY partner
 --      * active-low system reset
---      * SGMII serial cross-loopback: egress TX -> ingress RX and
---        ingress TX -> egress RX, so both PCS/PMA + GT links can come up
---        against each other over the modeled serial lanes
+--      * a TB-side SGMII PHY PARTNER (standalone gig_ethernet_pcs_pma,
+--        same proven configuration as the cores inside the subsystems,
+--        AN disabled at generation) whose GMII is the traffic injection/
+--        extraction point for the full-BD traffic test
+--      * SGMII serial CHAIN so every receiver has a live partner and
+--        traffic traverses the whole UUT:
+--          partner TX -> ingress RX   (frames in)
+--          ingress TX -> egress  RX   (idles; gives egress PCS a link)
+--          egress  TX -> partner RX   (frames out, checked at GMII)
 --      * MDIO bus pull-ups
 --      * three CsrAxiLiteManager VVCs on the exported AXI4-Lite ports
 --        (ingress MAC, egress MAC, Frame_Stats), clocked by the BD's own
@@ -33,6 +39,9 @@ library osvvm ;
 
 library osvvm_common ;
   context osvvm_common.OsvvmCommonContext ;
+
+library osvvm_AXI4 ;
+  context osvvm_AXI4.AxiStreamContext ;
 
 entity TbFullBd is
 end entity TbFullBd ;
@@ -54,9 +63,24 @@ architecture TestHarness of TbFullBd is
   signal ClocksLocked : std_logic ;
   signal nReset       : std_logic ;
 
-  -- SGMII serial lanes (egress TX -> ingress RX, ingress TX -> egress RX)
+  -- SGMII serial chain nets (see header)
   signal SgmiiIngressTxP, SgmiiIngressTxN : std_logic ;
   signal SgmiiEgressTxP,  SgmiiEgressTxN  : std_logic ;
+  signal PartnerTxP,      PartnerTxN      : std_logic ;
+
+  -- PHY partner (TB-side gig_ethernet_pcs_pma)
+  signal IndepClk         : std_logic := '0' ;   -- 50 MHz DRP/independent clock
+  signal PartnerReset     : std_logic ;
+  signal PartnerClk       : std_logic ;          -- userclk2 (125 MHz GMII clock)
+  signal PartnerClkEn     : std_logic ;          -- sgmii_clk_en
+  signal PartnerGmiiTxd   : std_logic_vector(7 downto 0) ;
+  signal PartnerGmiiTxEn  : std_logic ;
+  signal PartnerGmiiTxEr  : std_logic ;
+  signal PartnerGmiiRxd   : std_logic_vector(7 downto 0) ;
+  signal PartnerGmiiRxDv  : std_logic ;
+  signal PartnerGmiiRxEr  : std_logic ;
+  signal PartnerStatus    : std_logic_vector(15 downto 0) ;
+  signal PartnerResetDone : std_logic ;
 
   -- MDIO
   signal MdioIngress, MdioEgress : std_logic ;
@@ -99,6 +123,28 @@ architecture TestHarness of TbFullBd is
     Address(17 downto 0),
     DataToModel(31 downto 0),
     DataFromModel(31 downto 0)
+  ) ;
+
+  -- Egress TX control stream (s_axis_txc): the AXI Ethernet buffer's TX
+  -- engine needs a 6-word control packet per frame; an OSVVM
+  -- AxiStreamTransmitter VVC plays the host DMA's role.
+  constant TXC_TID_W   : integer := 8 ;
+  constant TXC_TDEST_W : integer := 4 ;
+  constant TXC_TUSER_W : integer := 4 ;
+  constant TXC_INIT_ID   : std_logic_vector(TXC_TID_W-1 downto 0)   := (others => '0') ;
+  constant TXC_INIT_DEST : std_logic_vector(TXC_TDEST_W-1 downto 0) := (others => '0') ;
+  constant TXC_INIT_USER : std_logic_vector(TXC_TUSER_W-1 downto 0) := (others => '0') ;
+  signal TxcTValid, TxcTReady, TxcTLast : std_logic ;
+  signal TxcTData : std_logic_vector(31 downto 0) ;
+  signal TxcTStrb, TxcTKeep : std_logic_vector(3 downto 0) ;
+  signal TxcTID   : std_logic_vector(TXC_TID_W-1 downto 0) ;
+  signal TxcTDest : std_logic_vector(TXC_TDEST_W-1 downto 0) ;
+  signal TxcTUser : std_logic_vector(TXC_TUSER_W-1 downto 0) ;
+  signal TxcRec : StreamRecType(
+    DataToModel   (31 downto 0),
+    DataFromModel (31 downto 0),
+    ParamToModel  (TXC_TID_W + TXC_TDEST_W + TXC_TUSER_W downto 0),
+    ParamFromModel(TXC_TID_W + TXC_TDEST_W + TXC_TUSER_W downto 0)
   ) ;
 
   -- Verilog BD wrapper (default component binding, resolved via -L)
@@ -165,6 +211,11 @@ architecture TestHarness of TbFullBd is
       s_axi_stats_wready    : out   std_logic ;
       s_axi_stats_wstrb     : in    std_logic_vector(3 downto 0) ;
       s_axi_stats_wvalid    : in    std_logic ;
+      s_axis_txc_tdata      : in    std_logic_vector(31 downto 0) ;
+      s_axis_txc_tkeep      : in    std_logic_vector(3 downto 0) ;
+      s_axis_txc_tlast      : in    std_logic ;
+      s_axis_txc_tready     : out   std_logic ;
+      s_axis_txc_tvalid     : in    std_logic ;
       sgmii_egress_rxn      : in    std_logic ;
       sgmii_egress_rxp      : in    std_logic ;
       sgmii_egress_txn      : out   std_logic ;
@@ -179,6 +230,44 @@ architecture TestHarness of TbFullBd is
     ) ;
   end component Top_wrapper ;
 
+  -- TB-side SGMII PHY partner (Verilog IP, default binding via -L)
+  component phy_partner_pcs_pma is
+    port (
+      gtrefclk_p             : in  std_logic ;
+      gtrefclk_n             : in  std_logic ;
+      gtrefclk_out           : out std_logic ;
+      txn                    : out std_logic ;
+      txp                    : out std_logic ;
+      rxn                    : in  std_logic ;
+      rxp                    : in  std_logic ;
+      independent_clock_bufg : in  std_logic ;
+      userclk_out            : out std_logic ;
+      userclk2_out           : out std_logic ;
+      rxuserclk_out          : out std_logic ;
+      rxuserclk2_out         : out std_logic ;
+      gtpowergood            : out std_logic ;
+      resetdone              : out std_logic ;
+      pma_reset_out          : out std_logic ;
+      mmcm_locked_out        : out std_logic ;
+      sgmii_clk_r            : out std_logic ;
+      sgmii_clk_f            : out std_logic ;
+      sgmii_clk_en           : out std_logic ;
+      gmii_txd               : in  std_logic_vector(7 downto 0) ;
+      gmii_tx_en             : in  std_logic ;
+      gmii_tx_er             : in  std_logic ;
+      gmii_rxd               : out std_logic_vector(7 downto 0) ;
+      gmii_rx_dv             : out std_logic ;
+      gmii_rx_er             : out std_logic ;
+      gmii_isolate           : out std_logic ;
+      configuration_vector   : in  std_logic_vector(4 downto 0) ;
+      speed_is_10_100        : in  std_logic ;
+      speed_is_100           : in  std_logic ;
+      status_vector          : out std_logic_vector(15 downto 0) ;
+      reset                  : in  std_logic ;
+      signal_detect          : in  std_logic
+    ) ;
+  end component phy_partner_pcs_pma ;
+
 begin
 
   ------------------------------------------------------------
@@ -188,8 +277,10 @@ begin
   SysClkN <= not SysClkP ;
   MgtClkP <= not MgtClkP after tperiod_MgtClk / 2 ;
   MgtClkN <= not MgtClkP ;
+  IndepClk <= not IndepClk after 10 ns ;   -- 50 MHz for the PHY partner
 
   SystemResetn <= '0', '1' after 20 * tperiod_SysClk ;
+  PartnerReset <= not SystemResetn ;
 
   -- VVC-side reset: released once the BD's clocks are locked
   nReset <= ClocksLocked ;
@@ -264,18 +355,98 @@ begin
       s_axi_stats_wready    => StsWReady,
       s_axi_stats_wstrb     => StsWStrb,
       s_axi_stats_wvalid    => StsWValid,
-      -- Serial cross-loopback: each MAC's TX feeds the other MAC's RX
+      s_axis_txc_tdata      => TxcTData,
+      s_axis_txc_tkeep      => TxcTKeep,
+      s_axis_txc_tlast      => TxcTLast,
+      s_axis_txc_tready     => TxcTReady,
+      s_axis_txc_tvalid     => TxcTValid,
+      -- Serial chain: partner TX -> ingress RX; ingress TX -> egress RX
+      -- (idles, link partner); egress TX -> partner RX (checked traffic)
       sgmii_egress_rxn      => SgmiiIngressTxN,
       sgmii_egress_rxp      => SgmiiIngressTxP,
       sgmii_egress_txn      => SgmiiEgressTxN,
       sgmii_egress_txp      => SgmiiEgressTxP,
-      sgmii_ingress_rxn     => SgmiiEgressTxN,
-      sgmii_ingress_rxp     => SgmiiEgressTxP,
+      sgmii_ingress_rxn     => PartnerTxN,
+      sgmii_ingress_rxp     => PartnerTxP,
       sgmii_ingress_txn     => SgmiiIngressTxN,
       sgmii_ingress_txp     => SgmiiIngressTxP,
       sys_clk_in_clk_n      => SysClkN,
       sys_clk_in_clk_p      => SysClkP,
       system_resetn         => SystemResetn
+    ) ;
+
+  ------------------------------------------------------------
+  -- TB-side SGMII PHY partner (traffic injection/extraction)
+  ------------------------------------------------------------
+  PhyPartner_1 : phy_partner_pcs_pma
+    port map (
+      gtrefclk_p             => MgtClkP,
+      gtrefclk_n             => MgtClkN,
+      gtrefclk_out           => open,
+      txn                    => PartnerTxN,
+      txp                    => PartnerTxP,
+      rxn                    => SgmiiEgressTxN,
+      rxp                    => SgmiiEgressTxP,
+      independent_clock_bufg => IndepClk,
+      userclk_out            => open,
+      userclk2_out           => PartnerClk,
+      rxuserclk_out          => open,
+      rxuserclk2_out         => open,
+      gtpowergood            => open,
+      resetdone              => PartnerResetDone,
+      pma_reset_out          => open,
+      mmcm_locked_out        => open,
+      sgmii_clk_r            => open,
+      sgmii_clk_f            => open,
+      sgmii_clk_en           => PartnerClkEn,
+      gmii_txd               => PartnerGmiiTxd,
+      gmii_tx_en             => PartnerGmiiTxEn,
+      gmii_tx_er             => PartnerGmiiTxEr,
+      gmii_rxd               => PartnerGmiiRxd,
+      gmii_rx_dv             => PartnerGmiiRxDv,
+      gmii_rx_er             => PartnerGmiiRxEr,
+      gmii_isolate           => open,
+      configuration_vector   => "00000",
+      speed_is_10_100        => '0',
+      speed_is_100           => '0',
+      status_vector          => PartnerStatus,
+      reset                  => PartnerReset,
+      signal_detect          => '1'
+    ) ;
+
+  ------------------------------------------------------------
+  -- Egress TX-control VVC (plays the host DMA: one 6-word control
+  -- packet per frame on s_axis_txc)
+  ------------------------------------------------------------
+  TxcTransmitter_1 : AxiStreamTransmitter
+    generic map (
+      INIT_ID        => TXC_INIT_ID,
+      INIT_DEST      => TXC_INIT_DEST,
+      INIT_USER      => TXC_INIT_USER,
+      INIT_LAST      => 0,
+      tperiod_Clk    => tperiod_AxiClk,
+      tpd_Clk_TValid => tpd,
+      tpd_Clk_TID    => tpd,
+      tpd_Clk_TDest  => tpd,
+      tpd_Clk_TUser  => tpd,
+      tpd_Clk_TData  => tpd,
+      tpd_Clk_TStrb  => tpd,
+      tpd_Clk_TKeep  => tpd,
+      tpd_Clk_TLast  => tpd
+    )
+    port map (
+      Clk      => AxiClk,
+      nReset   => nReset,
+      TValid   => TxcTValid,
+      TReady   => TxcTReady,
+      TID      => TxcTID,
+      TDest    => TxcTDest,
+      TUser    => TxcTUser,
+      TData    => TxcTData,
+      TStrb    => TxcTStrb,
+      TKeep    => TxcTKeep,
+      TLast    => TxcTLast,
+      TransRec => TxcRec
     ) ;
 
   ------------------------------------------------------------
@@ -369,15 +540,26 @@ begin
     ) ;
 
   ------------------------------------------------------------
-  -- Test sequencer
+  -- Test sequencer (the FullTraffic architecture: bring-up + traffic)
   ------------------------------------------------------------
-  TestCtrl_1 : entity work.TestCtrlFull
+  TestCtrl_1 : entity work.TestCtrlFull(FullTraffic)
     port map (
-      nReset       => nReset,
-      ClocksLocked => ClocksLocked,
-      IngressRec   => IngressRec,
-      EgressRec    => EgressRec,
-      StatsRec     => StatsRec
+      nReset           => nReset,
+      ClocksLocked     => ClocksLocked,
+      IngressRec       => IngressRec,
+      EgressRec        => EgressRec,
+      StatsRec         => StatsRec,
+      GmiiClk          => PartnerClk,
+      GmiiClkEn        => PartnerClkEn,
+      GmiiTxd          => PartnerGmiiTxd,
+      GmiiTxEn         => PartnerGmiiTxEn,
+      GmiiTxEr         => PartnerGmiiTxEr,
+      GmiiRxd          => PartnerGmiiRxd,
+      GmiiRxDv         => PartnerGmiiRxDv,
+      GmiiRxEr         => PartnerGmiiRxEr,
+      PartnerStatus    => PartnerStatus,
+      PartnerResetDone => PartnerResetDone,
+      TxcRec           => TxcRec
     ) ;
 
 end architecture TestHarness ;

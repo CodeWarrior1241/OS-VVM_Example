@@ -268,13 +268,26 @@ proc build_all {} {
         endgroup
     }
 
+    # The egress TX CONTROL stream is exported at the BD boundary: the AXI
+    # Ethernet buffer's TX engine requires a 6-word control packet per
+    # frame on s_axis_txc, and with it unconnected the egress MAC never
+    # transmits a single beat (discovered by the full-BD traffic test --
+    # the packet FIFO filled to 32 KB while FRAMES_OUT stayed 0). At board
+    # level the host DMA provides these words; in the full-BD testbench an
+    # OSVVM AxiStreamTransmitter VVC does.
+    startgroup
+        make_bd_intf_pins_external [get_bd_intf_pins $eth_egress/s_axis_txc]
+        set_property name s_axis_txc [get_bd_intf_ports s_axis_txc_0]
+        set_property CONFIG.FREQ_HZ 125000000 [get_bd_intf_ports /s_axis_txc]
+    endgroup
+
     # Export the 125 MHz AXI/AXIS clock so the external AXI-Lite management
     # ports have an associated clock at the BD boundary (and so a testbench
     # driving s_axi_* has the right clock available).
     create_bd_port -dir O -type clk axi_clk_125MHz
     connect_bd_net [get_bd_ports axi_clk_125MHz] [get_bd_pins $system_clock/clk_out1]
     set_property CONFIG.FREQ_HZ 125000000 [get_bd_ports axi_clk_125MHz]
-    set_property CONFIG.ASSOCIATED_BUSIF {s_axi_ingress:s_axi_egress:s_axi_stats} [get_bd_ports axi_clk_125MHz]
+    set_property CONFIG.ASSOCIATED_BUSIF {s_axi_ingress:s_axi_egress:s_axi_stats:s_axis_txc} [get_bd_ports axi_clk_125MHz]
 
     ###########################################################################
     # AXI4-Stream Frame FIFO (FIFO Generator, embedded AXI4-Stream interface)
@@ -313,10 +326,11 @@ proc build_all {} {
 
     # Deliberately unconnected AXIS interfaces (single-direction bridge demo):
     #   - $eth_ingress/m_axis_rxs  (RX status: checksum-offload metadata)
-    #   - $eth_egress/s_axis_txc   (TX control: checksum-offload directives)
     #   - $eth_ingress/s_axis_txd + s_axis_txc, $eth_egress/m_axis_rxd + m_axis_rxs
     # The verification target is the AXIS frame datapath; the offload sideband
     # streams and the reverse direction are out of scope (see README).
+    # NOTE: $eth_egress/s_axis_txc is NOT in this list -- it is mandatory
+    # for TX and is exported at the BD boundary below.
 
     ###########################################################################
     # Frame statistics block (open-logic based, module reference)
@@ -397,6 +411,34 @@ proc build_all {} {
     # (plus the TbEthernetFifo datapath testbench alongside). sim_1 stays
     # DUT-only; full_sim_export.tcl depends on that to generate DUT-only
     # compile scripts.
+
+    ###########################################################################
+    # TB-only IP: SGMII PHY partner for the full-BD traffic test
+    ###########################################################################
+    # A standalone gig_ethernet_pcs_pma with the same proven configuration
+    # as the cores inside the Ethernet subsystems (SGMII over GTH, 125 MHz
+    # refclk, shared logic in core) but with no management interface and
+    # autonegotiation DISABLED at generation. The full-BD testbench drives
+    # its GMII with frames; its serial lanes chain into the UUT's SGMII
+    # pins (see TbFullBd.vhd). Simulation-only: never instantiated in the
+    # BD, never synthesized to a netlist for implementation.
+    puts "INFO: Creating SGMII PHY-partner IP (full-BD traffic test)..."
+    create_ip -vlnv [resolve_ip_vlnv xilinx.com:ip:gig_ethernet_pcs_pma 17.0] \
+        -module_name phy_partner_pcs_pma
+    set_property -dict [list \
+        CONFIG.Standard {SGMII} \
+        CONFIG.Physical_Interface {Transceiver} \
+        CONFIG.Management_Interface {FALSE} \
+        CONFIG.Auto_Negotiation {FALSE} \
+        CONFIG.SGMII_Mode {10_100_1000} \
+        CONFIG.SupportLevel {Include_Shared_Logic_in_Core} \
+        CONFIG.GT_Type {GTH} \
+        CONFIG.RefClkRate {125} \
+        CONFIG.DrpClkRate {50.0} \
+    ] [get_ips phy_partner_pcs_pma]
+    generate_target all [get_ips phy_partner_pcs_pma]
+    export_ip_user_files -of_objects [get_ips phy_partner_pcs_pma] -no_script -sync -force -quiet
+
     puts "INFO: Registering OSVVM testbenches in simulation fileset sim_tb..."
     if {[llength [get_filesets -quiet sim_tb]] == 0} {
         create_fileset -simset sim_tb
@@ -410,6 +452,7 @@ proc build_all {} {
         "$project_dir/sim/tb/TestCtrlFull_e.vhd" \
         "$project_dir/sim/tb/TbFullBd.vhd" \
         "$project_dir/sim/tb/TestCtrl_FullBringup.vhd" \
+        "$project_dir/sim/tb/TestCtrl_FullTraffic.vhd" \
     ]
     add_files -fileset sim_tb -norecurse $tb_files
     set_property file_type {VHDL 2008} [get_files -of_objects [get_filesets sim_tb] $tb_files]

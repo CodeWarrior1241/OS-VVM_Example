@@ -44,6 +44,20 @@ add wave -hex /TbFullBd/EgrArAddr
 add wave -hex /TbFullBd/EgrRData
 add wave /TbFullBd/EgrRValid
 
+add wave -divider "GMII traffic at the PHY partner (frames in/out)"
+add wave -hex /TbFullBd/PartnerGmiiTxd
+add wave /TbFullBd/PartnerGmiiTxEn
+add wave -hex /TbFullBd/PartnerGmiiRxd
+add wave /TbFullBd/PartnerGmiiRxDv
+add wave -hex /TbFullBd/PartnerStatus
+add wave /TbFullBd/PartnerResetDone
+
+add wave -divider "Egress TX control stream (s_axis_txc)"
+add wave /TbFullBd/TxcTValid
+add wave /TbFullBd/TxcTReady
+add wave -hex /TbFullBd/TxcTData
+add wave /TbFullBd/TxcTLast
+
 add wave -divider "Frame_Stats AXI4-Lite (s_axi_stats)"
 add wave /TbFullBd/StsAwValid
 add wave -hex /TbFullBd/StsAwAddr

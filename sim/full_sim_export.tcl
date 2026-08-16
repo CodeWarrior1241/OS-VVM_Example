@@ -31,20 +31,34 @@ set sim_dir [file normalize [file dirname [info script]]]
 set project_root [file normalize "$sim_dir/.."]
 set project_xpr "$project_root/OSVVM_Ethernet_Sim.xpr"
 
-# Precompiled Xilinx libraries for Questa (compile_simlib output).
-# REQUIRED: the QUESTA_COMPILED_LIB_DIR environment variable must point at
-# the compile_simlib output directory -- no path is baked in here, so the
-# scripts stay portable across machines. Generation command: README 5.4.
-if {![info exists ::env(QUESTA_COMPILED_LIB_DIR)]} {
-    error "full_sim_export.tcl: QUESTA_COMPILED_LIB_DIR is not set.\nPoint it at your compile_simlib output directory (see README 5.4), e.g.:\n  export QUESTA_COMPILED_LIB_DIR=/path/to/Questa_Libraries_Vivado"
+# Which simulators to export scripts for. Default: both. Callers needing
+# only one set the FULL_SIM_EXPORT_SIMS environment variable -- run_sim.tcl
+# asks for "xsim" alone, so an XSim-only machine never has to own the
+# precompiled Questa libraries.
+set export_sims {questa xsim}
+if {[info exists ::env(FULL_SIM_EXPORT_SIMS)] && $::env(FULL_SIM_EXPORT_SIMS) ne ""} {
+    set export_sims $::env(FULL_SIM_EXPORT_SIMS)
 }
-set QUESTA_COMPILED_LIBS $::env(QUESTA_COMPILED_LIB_DIR)
+set want_questa [expr {[lsearch -exact $export_sims questa] >= 0}]
+set want_xsim   [expr {[lsearch -exact $export_sims xsim]   >= 0}]
+
+# Precompiled Xilinx libraries, needed by the QUESTA export only (XSim ships
+# its Xilinx libraries with Vivado). REQUIRED for that export: the
+# QUESTA_COMPILED_LIB_DIR environment variable must point at the
+# compile_simlib output directory -- no path is baked in here, so the
+# scripts stay portable across machines. Generation command: README 5.4.
+if {$want_questa} {
+    if {![info exists ::env(QUESTA_COMPILED_LIB_DIR)]} {
+        error "full_sim_export.tcl: QUESTA_COMPILED_LIB_DIR is not set.\nPoint it at your compile_simlib output directory (see README 5.4), e.g.:\n  export QUESTA_COMPILED_LIB_DIR=/path/to/Questa_Libraries_Vivado\n(Exporting XSim scripts only? Set FULL_SIM_EXPORT_SIMS=xsim.)"
+    }
+    set QUESTA_COMPILED_LIBS $::env(QUESTA_COMPILED_LIB_DIR)
+    if {![file isdirectory $QUESTA_COMPILED_LIBS]} {
+        error "full_sim_export.tcl: precompiled Questa libraries not found at\n  $QUESTA_COMPILED_LIBS (from QUESTA_COMPILED_LIB_DIR)\nGenerate them with compile_simlib (see README 5.4)."
+    }
+}
 
 if {![file exists $project_xpr]} {
     error "full_sim_export.tcl: $project_xpr not found - run the Vivado build first (vivado -mode batch -source build_all.tcl)"
-}
-if {![file isdirectory $QUESTA_COMPILED_LIBS]} {
-    error "full_sim_export.tcl: precompiled Questa libraries not found at\n  $QUESTA_COMPILED_LIBS (from QUESTA_COMPILED_LIB_DIR)\nGenerate them with compile_simlib (see README 5.4)."
 }
 
 # Reuse the project if this session already has it open (run_sim.tcl
@@ -71,15 +85,21 @@ set_property top_lib xil_defaultlib [get_filesets sim_1]
 update_compile_order -fileset sim_1
 
 # Questa scripts (reference the precompiled libraries)
-set_property target_simulator Questa [current_project]
-set_property compxlib.questa_compiled_library_dir $QUESTA_COMPILED_LIBS [current_project]
-launch_simulation -scripts_only -absolute_path
-close_sim -quiet
+if {$want_questa} {
+    puts "full_sim_export.tcl: exporting Questa scripts..."
+    set_property target_simulator Questa [current_project]
+    set_property compxlib.questa_compiled_library_dir $QUESTA_COMPILED_LIBS [current_project]
+    launch_simulation -scripts_only -absolute_path
+    close_sim -quiet
+}
 
 # XSim scripts (XSim ships its own precompiled Xilinx libraries)
-set_property target_simulator XSim [current_project]
-launch_simulation -scripts_only -absolute_path
-close_sim -quiet
+if {$want_xsim} {
+    puts "full_sim_export.tcl: exporting XSim scripts..."
+    set_property target_simulator XSim [current_project]
+    launch_simulation -scripts_only -absolute_path
+    close_sim -quiet
+}
 
 current_fileset -simset $prev_simset
 
