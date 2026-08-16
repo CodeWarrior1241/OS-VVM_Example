@@ -548,14 +548,42 @@ good for:
 to a Wireshark-ready capture, regenerated fresh on every run**
 (`write_mode` truncates; a stale capture can never masquerade as current).
 The file is nanosecond-resolution libpcap, LINKTYPE_ETHERNET, stamped with
-*simulation* time, ~950 KB for a 403-frame run. Frames include their FCS —
-deliberately, since ~20% carry an injected FCS error: enable
-`Edit → Preferences → Protocols → Ethernet → Validate the Ethernet
-checksum` in Wireshark and the corrupted frames light up red, which makes
-the capture a self-demonstrating artifact of the error-injection
-machinery. (`capinfos`/`tshark` parse it directly; the capture is of the
-*sent* stream, so it is also the reference input for replaying against
-other implementations.)
+*simulation* time, ~950 KB for a 403-frame run. The capture is of the
+*sent* stream, so it also serves as reference input for replaying against
+other implementations, and `capinfos`/`tshark` parse it directly.
+
+**Making Wireshark show the injected FCS errors.** Frames are written
+*with* their FCS, deliberately, since ~15–20% of them carry an injected
+error — but a pcap has no flag announcing "these frames include their
+FCS", so **out of the box Wireshark treats those 4 bytes as ordinary
+payload and shows nothing wrong**. Two preferences under
+`Edit → Preferences → Protocols → Ethernet` are needed, and the first is
+the one that is easy to miss:
+
+1. **Assume packets have FCS → Always** (`eth.assume_fcs`, default
+   *Never*) — tells the dissector the trailing 4 bytes *are* the FCS.
+2. **Validate the Ethernet checksum if possible** (`eth.check_fcs`,
+   default off) — makes it actually verify them.
+
+With both enabled, the corrupted frames pick up Wireshark's default
+*Checksum Errors* coloring (red text on a black row — not a red
+background), and the display filter `eth.fcs.status == "Bad"` isolates
+them exactly; the count it reports should match the `FcsError` coverage
+bin in the transcript. That makes the capture a self-demonstrating
+artifact of the error-injection machinery. To check without the GUI:
+
+```bash
+tshark -r sim/TbEthernetFifo_FrameLoopback_tx.pcap \
+       -o eth.assume_fcs:TRUE -o eth.check_fcs:TRUE \
+       -Y 'eth.fcs.status=="Bad"' | wc -l
+```
+
+Two cosmetic quirks are expected and harmless: timestamps render as
+`1969-12-31`/`1970-01-01` because they are *simulation* time starting near
+zero (i.e. the Unix epoch), and frames with payloads ≤ 1500 bytes carry a
+real 802.3 length field, so Wireshark dissects them as 802.3/LLC and the
+random payload yields nonsense LLC fields with their own expert warnings.
+Neither affects the FCS check.
 
 **Register dump.** Both test cases end with a fixed-format dump
 (`FRAME_STATS_DUMP <REG> = 0x<hex> (<dec>)`, one line per readable
