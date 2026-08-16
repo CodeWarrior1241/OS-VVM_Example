@@ -11,10 +11,16 @@ This is a call that can be made later. For now, this project confirms that
 integrating OS-VVM with Vivado simulator is doable, and with Questa (or Riviera, etc.)
 is ideal.
 
+Please note that this Readme is *comprehensive* by design. I tried to make
+it self-stranding, so if you need something to build, run, paths adjusted, etc.
+it's *likely* in here, so please search!
+
 The synthesizable design is an Ethernet frame bridge: two AMD/Xilinx
 **AXI 1G/2.5G Ethernet Subsystems** (SGMII over GT transceivers) joined by an
 **AXI4-Stream FIFO Generator** in packet mode, with jumbo-frame support
-enabled end to end.
+enabled end to end. Several design decisions were drawn from prior work,
+such as the 125 MHz clock, etc. This was to get a design simulating faster
+out the door, bout shouldn't really matter much for this demonstration.
 
 There are **two simulation modes**, each available on both simulators:
 
@@ -37,9 +43,9 @@ There are **two simulation modes**, each available on both simulators:
 | OSVVM | OsvvmLibraries 2026.05 (`2494959`, recursive submodules) |
 | open-logic | 4.6.0 (`ecca8af`) — `olo_axi_lite_slave` inside the Frame_Stats block |
 | Frame sizes | 64 B – 9018 B (9000-byte-payload jumbo), MAC jumbo support enabled |
-| Questa result | **PASSED** — 403 frames, 945,632 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~15 s turnaround |
-| XSim result | **PASSED** — 403 frames, 902,852 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~87 s turnaround (§5.3) |
-| Full-BD sim (`--full_sim`) | **PASSED** on both simulators — entire BD incl. GT SecureIP, SGMII links up over serial loopback, 303 affirmations (§5.4) |
+| Questa result | **PASSED** — 403 frames, 945,639 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~15 s turnaround |
+| XSim result | **PASSED** — 403 frames, 902,859 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~87 s turnaround (§5.3) |
+| Full-BD sim (`--full_sim`) | **PASSED** on both simulators — entire BD incl. GT SecureIP, SGMII links up over serial loopback, 310 affirmations (§5.4) |
 
 The design targets the Alinx AXAU15 board's FPGA part but is intended for
 **behavioral simulation + synthesis only** — no pinout, no implementation, no
@@ -53,15 +59,16 @@ bitstream.
    - [2.2 Data Path](#22-data-path)
    - [2.3 Deliberately Unconnected Interfaces](#23-deliberately-unconnected-interfaces)
    - [2.4 Frame_Stats — Register Observability](#24-frame_stats--register-observability-built-on-open-logic)
-   - [2.5 Reset Handling — a Reviewed Decision](#25-reset-handling--a-reviewed-decision)
+   - [2.5 Reset Handling](#25-reset-handling)
    - [2.6 Build Script](#26-build-script)
 3. [The Testbench](#3-the-testbench)
-   - [3.1 Verification Boundary — an Honest Decision](#31-verification-boundary--an-honest-decision)
+   - [3.1 Verification Boundary](#31-verification-boundary)
    - [3.2 Testbench Architecture](#32-testbench-architecture)
    - [3.3 What a Test Run Does](#33-what-a-test-run-does)
    - [3.4 Result](#34-result)
+   - [3.5 Simulation Artifacts](#35-simulation-artifacts)
 4. [OSVVM Usage and Advantages](#4-osvvm-usage-and-advantages)
-   - [4.1 What OSVVM Concretely Buys This Project](#41-what-osvvm-concretely-buys-this-project)
+   - [4.1 What OSVVM Buys For This Project](#41-what-osvvm-buys-for-this-project)
    - [4.2 Feature-by-Feature](#42-feature-by-feature)
 5. [Running the Simulation](#5-running-the-simulation)
    - [5.1 Questa (primary flow)](#51-questa-primary-flow)
@@ -276,26 +283,12 @@ The same RTL instance is verified in the testbench through an AXI4-Lite
 manager VVC driven with OSVVM's standard address-bus transactions (§3),
 closing the loop between stream traffic and register observability.
 
-### 2.5 Reset Handling — a Reviewed Decision
+### 2.5 Reset Handling
 
 The 125 MHz domain reset comes from the Xilinx `proc_sys_reset`
 (`AXI_Reset`): asynchronous assertion, synchronous de-assertion, sequenced
 interconnect/peripheral resets, and `dcm_locked` gating so nothing leaves
 reset until the PLL is stable.
-
-As part of bringing `open-logic` into the dependency set, its
-**`olo_base_reset_gen`** block was evaluated as a replacement. It is a
-textbook example of good reset VHDL — an async-capable input synchronizer
-with the correct synthesis attributes baked into the source (`ASYNC_REG`,
-shift-register-extraction suppression, register preservation), configurable
-input polarity, a guaranteed minimum reset pulse width, and glitch-free
-synchronous de-assertion — and it drops into a Vivado BD as a module
-reference. The review decision was to **keep the Xilinx block**: it is
-BD-native, already provides the async-assert/sync-deassert behavior, and
-adds the `dcm_locked` gating that `olo_base_reset_gen` would need extra glue
-logic (lock-AND-reset gating plus an output inverter) to replicate.
-`olo_base_reset_gen` remains the identified open-logic candidate for designs
-that want a pure-VHDL, vendor-neutral reset generator.
 
 ### 2.6 Build Script
 
@@ -351,7 +344,7 @@ The second testbench, the full-BD bring-up test behind `--full_sim`, is
 described in §5.4; the boundary discussion below explains why the two exist
 and how they divide the work.
 
-### 3.1 Verification Boundary — an Honest Decision
+### 3.1 Verification Boundary
 
 The tasking calls for behavioral simulation of the design with AxiStream
 VVCs driving and checking *real frames*. Simulating the entire BD through
@@ -384,6 +377,24 @@ bring-up/integration test (links up over serial loopback, MACs programmed
 over AXI4-Lite). The split is deliberate: exhaustive frame-level
 verification where the project-authored logic lives, at per-commit speed;
 full-stack integration proof on demand.
+
+Block by block (names as instantiated by `build_all.tcl`), here is exactly
+what each mode simulates:
+
+| BD block | Datapath test (default) | Full BD (`--full_sim`) |
+|---|---|---|
+| `Axis_Frame_Fifo` | **Simulated — the exact BD instance** (Vivado-generated netlist `Top_Axis_Frame_Fifo_0.v` + fifo_generator behavioral model), under maximum frame stress | Simulated, but **functionally idle** — the client AXIS interfaces are internal to the BD (§2.3), so no frames flow |
+| `Frame_Stats` | **Simulated — source-identical RTL** (`rtl/frame_stats.vhd` + open-logic, the same sources the BD module reference consumes), counters cross-checked against ~1M-check traffic | Simulated (the BD's own instance), exercised over `s_axi_stats` (MAGIC, register dump, counters-zero) |
+| `Ethernet_MAC_Ingress` | Not simulated — `AxiStreamTransmitter` VVC stands in at its `m_axis_rxd` client interface | **Simulated in full**: Ethernet buffer, TEMAC (registers + MDIO over `s_axi_ingress`), SGMII PCS/PMA, GT SecureIP (link up over serial loopback) |
+| `Ethernet_MAC_Egress` | Not simulated — `AxiStreamReceiver` VVC stands in at its `s_axis_txd` client interface | **Simulated in full**: same hierarchy, via `s_axi_egress` and the other serial lane pair |
+| `System_Clock` | Not simulated — OSVVM `CreateClock` (125 MHz) replaces it | Simulated (clk_wiz MMCM model, 200 MHz in → 125 MHz + 50 MHz `ref_clk`; the test waits on its `clocks_locked`) |
+| `AXI_Reset` | Not simulated — OSVVM `CreateReset` replaces it | Simulated (proc_sys_reset, sequencing all BD resets) |
+| `signal_detect_const` | Absent (only exists to feed the MACs) | Simulated (xlconstant tie-off) |
+
+The two rows the datapath test simulates are precisely the blocks the
+project **authored or configured**; `--full_sim` covers all seven at
+bring-up intensity. Between the two modes, every block in the BD is
+simulated — and each is stressed by the mode best suited to it.
 
 ### 3.2 Testbench Architecture
 
@@ -513,34 +524,54 @@ machine-checked completion criterion.
 %% PASSED  Egress stall counter nonzero (316574 cycles) - backpressure was exercised
 %% INFO    Frame_Stats counters verified and cleared via AXI4-Lite
 %% 4439752 ns  DONE  PASSED  TbEthernetFifo_FrameLoopback
-%%             Passed: 945632  Affirmations Checked: 945632
+%%             Passed: 945639  Affirmations Checked: 945639
 ```
 
 On Questa, 403 frames close all coverage in ~4.4 ms of simulated time (~11 s
 wall clock); on XSim the different seed path closes coverage too (see the
-results table). OSVVM also emits machine-readable YAML (alert
-summary, coverage model, scoreboard statistics) plus an HTML index — the
-artifacts a verification team hooks into CI dashboards.
+results table).
 
-**Reviewing the Frame_Stats values after a run.** Both test cases end with
-a fixed-format register dump (`FRAME_STATS_DUMP <REG> = 0x<hex> (<dec>)`,
-one line per readable register, logged at ALWAYS so no log filtering can
-drop it). The lines land in the persisted OSVVM transcript —
-`sim/OsvvmTemp_Questa/<TestName>.log` (Questa) and
-`sim/xsim_work/OsvvmTemp_XSIM/<TestName>.log` (XSim; the `--full_sim`
-equivalents live next to the exported scripts) — so a single
-`grep FRAME_STATS_DUMP` recovers the counter values from any past run,
-and CI can trend them across regressions. For *live* observation, the
-`--detailed` Questa mode and the XSim `-gui` mode both include the six
-counters in their wave sets (radix unsigned), so you can watch
-`FramesIn`/`BytesOut`/`StallOut` step in real time against the AXIS
+### 3.5 Simulation Artifacts
+
+Every run leaves reviewable evidence behind. What, where, and what it is
+good for:
+
+| Artifact | Where (Questa / XSim) | Contents |
+|---|---|---|
+| OSVVM transcript | `sim/OsvvmTemp_Questa/<TestName>.log` / `sim/xsim_work/OsvvmTemp_XSIM/<TestName>.log` | Every log line and affirmation of the run, in time order (`--full_sim` equivalents live next to the exported scripts) |
+| Frame capture (PCAP) | `sim/TbEthernetFifo_FrameLoopback_tx.pcap` / `sim/xsim_work/...same name` | Every transmitted frame — see below |
+| Register dump | inside the transcripts | `FRAME_STATS_DUMP` lines — see below |
+| OSVVM reports | YAML + HTML next to the transcripts | Alert/coverage/scoreboard accounting for CI dashboards |
+| Waveforms | `sim/vsim.wlf` / `sim/xsim_work/*.wdb` | Signal history — full-design depth in detailed mode (§5.1/§5.2) |
+
+**Frame capture (PCAP).** The transmitter writes **every generated frame
+to a Wireshark-ready capture, regenerated fresh on every run**
+(`write_mode` truncates; a stale capture can never masquerade as current).
+The file is nanosecond-resolution libpcap, LINKTYPE_ETHERNET, stamped with
+*simulation* time, ~950 KB for a 403-frame run. Frames include their FCS —
+deliberately, since ~20% carry an injected FCS error: enable
+`Edit → Preferences → Protocols → Ethernet → Validate the Ethernet
+checksum` in Wireshark and the corrupted frames light up red, which makes
+the capture a self-demonstrating artifact of the error-injection
+machinery. (`capinfos`/`tshark` parse it directly; the capture is of the
+*sent* stream, so it is also the reference input for replaying against
+other implementations.)
+
+**Register dump.** Both test cases end with a fixed-format dump
+(`FRAME_STATS_DUMP <REG> = 0x<hex> (<dec>)`, one line per readable
+register, logged at ALWAYS so no log filtering can drop it) into the
+transcript — a single `grep FRAME_STATS_DUMP` recovers the counter values
+from any past run, and CI can trend them across regressions. For *live*
+observation, the `--detailed` Questa mode and the XSim `-gui` mode both
+include the six counters in their wave sets (radix unsigned), so you can
+watch `FramesIn`/`BytesOut`/`StallOut` step in real time against the AXIS
 traffic that causes them.
 
 ---
 
 ## 4. OSVVM Usage and Advantages
 
-### 4.1 What OSVVM Concretely Buys This Project
+### 4.1 What OSVVM Buys For This Project
 
 Stripped of methodology language: this is what OSVVM delivers here that a
 hand-written testbench would have to grow, line by line, before it could
@@ -753,10 +784,10 @@ caches (OSVVM libraries prebuilt), Xeon Gold 6230R, Ubuntu 24.04, Vivado
 | Compile + elaborate (+ tool startup) | ~3.6 s | ~66 s |
 | Simulation execution | 11.2 s | 20.3 s |
 | **Total turnaround (warm)** | **14.8 s** | **86.6 s** |
-| Affirmations checked | 945,632 | 902,852 |
+| Affirmations checked | 945,639 | 902,859 |
 | Simulated time per wall-second (sim phase) | ~0.40 ms/s | ~0.22 ms/s |
 
-Reading it honestly:
+Breaking this down:
 
 * **Raw simulation speed differs by ~2×** (0.40 vs 0.22 simulated
   ms per wall-second) — significant but not decisive for a test this size.
@@ -787,11 +818,19 @@ transceivers as encrypted SecureIP models**), the clock wizard, reset
 block, packet FIFO, and Frame_Stats:
 
 ```bash
-./run_sim.sh --full_sim --batch      # Questa
-./run_sim.sh --full_sim              # Questa GUI
-tclsh run_sim.tcl -full_sim          # XSim (also: vivado -mode batch
-                                     #   -source run_sim.tcl -tclargs -full_sim)
+./run_sim.sh --full_sim --batch        # Questa
+./run_sim.sh --full_sim                # Questa GUI
+./run_sim.sh --full_sim --detailed     # Questa GUI + waves: +acc, log -r /*,
+                                       #   full-BD wave set (sim/full_wave.do)
+tclsh run_sim.tcl -full_sim            # XSim (also: vivado -mode batch
+                                       #   -source run_sim.tcl -tclargs -full_sim)
+tclsh run_sim.tcl -full_sim -gui -detailed   # XSim GUI + full wave logging
 ```
+
+GUI runs load a wave set of the UUT's observable in/out — the three
+AXI4-Lite ports, the SGMII serial lanes, and MDIO (the client AXIS
+interfaces are internal, §2.3); with `--detailed` every design object is
+additionally logged so the whole BD is browsable after the run.
 
 **What runs.** The harness (`tb/TbFullBd.vhd`) provides board-level wiring:
 200 MHz system clock, 125 MHz GT reference clocks, reset, MDIO pull-ups,
@@ -919,7 +958,7 @@ verifies **integration and bring-up** — clocking, resets, management
 plane, and the physical serial path — while the default fast sim verifies
 the **datapath**. They complement each other; neither replaces the other.
 
-**Results and benchmark.** Both simulators report `DONE PASSED` with 303
+**Results and benchmark.** Both simulators report `DONE PASSED` with 310
 affirmations on the identical test — links up through GT SecureIP at
 ~93 µs and ~111 µs simulated. Measured under the same conditions as the
 §5.3 datapath benchmark (same machine, warm caches — scripts exported, BD
@@ -931,7 +970,7 @@ of each launcher):
 | BD (incremental) + TB compile + elaborate | ~11 s | ~61 s |
 | Simulation execution | ~10 s | ~37 s |
 | **Total turnaround (warm)** | **21.5 s** | **98 s** |
-| Affirmations checked | 303 | 303 |
+| Affirmations checked | 310 | 310 |
 | Simulated time | 111.3 µs | 111.3 µs |
 
 The shape matches the datapath benchmark: XSim's raw simulation speed
@@ -966,17 +1005,30 @@ project settings — `target_simulator` and the `sim_1` top — it prints a
 notice when it does.)
 
 **Precompiled simulation libraries.** XSim ships its Xilinx libraries with
-Vivado; **Questa needs a one-time `compile_simlib` run**. This machine's
-library area is
-`/media/fpgadev/Dev_Tools/Mentor_Graphics/Questa_Libraries_Vivado_2026.1/Questa_Libraries_Vivado`
-(configured in `sim/full_sim_export.tcl`), generated with Vivado 2026.1:
+Vivado; **Questa needs a one-time `compile_simlib` run**, and the flow
+finds it through a **required environment variable** — no path is baked
+into the scripts:
+
+```bash
+export QUESTA_COMPILED_LIB_DIR=/path/to/compile_simlib/output
+```
+
+`sim/full_sim_export.tcl` refuses to run without it (and `run_sim.sh
+--full_sim` checks it up front with the same guidance). On this machine it
+is set in `~/.bashrc` to
+`/media/fpgadev/Dev_Tools/Mentor_Graphics/Questa_Libraries_Vivado_2026.1/Questa_Libraries_Vivado`,
+which was generated with Vivado 2026.1:
 
 ```tcl
 # In a Vivado 2026.1 Tcl shell (QUESTA_HOME = the Questa install root):
 compile_simlib -simulator questa -simulator_exec_path $::env(QUESTA_HOME)/bin \
   -family all -library all -force \
-  -directory /media/fpgadev/Dev_Tools/Mentor_Graphics/Questa_Libraries_Vivado_2026.1/Questa_Libraries_Vivado
+  -directory $::env(QUESTA_COMPILED_LIB_DIR)
 ```
+
+The variable is only consulted when the simulation scripts are (re)exported
+— an already-exported script set carries the resolved paths, so day-to-day
+runs do not need it.
 
 That produces ~480 libraries (unisim, secureip, xpm, and every IP static
 library — the full-BD sim links against ~20 of them) plus a `modelsim.ini`
