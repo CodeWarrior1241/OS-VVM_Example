@@ -1,0 +1,6 @@
+[submodule "deps/OsvvmLibraries"]
+	path = deps/OsvvmLibraries
+	url = https://github.com/OSVVM/OsvvmLibraries.git
+[submodule "deps/open-logic"]
+	path = deps/open-logic
+	url = https://github.com/open-logic/open-logic.git
