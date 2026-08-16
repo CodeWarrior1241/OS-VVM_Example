@@ -24,7 +24,7 @@ out the door, bout shouldn't really matter much for this demonstration.
 
 There are **two simulation modes**, each available on both simulators:
 
-* **Datapath mode** (the default, and the per-commit workhorse): the OSVVM
+* **Datapath mode** (the default): the OSVVM
   testbench drives real Ethernet frames (genuine CRC-32 FCS) from 64-byte
   minimum to **9018-byte jumbo** through the frame-FIFO datapath with
   **constrained-random stimulus**, **self-checking scoreboards**, and
@@ -32,8 +32,9 @@ There are **two simulation modes**, each available on both simulators:
   (§3).
 * **Full block-design mode** (`--full_sim`): the **entire BD** — both
   Ethernet subsystems with the **GT transceivers as SecureIP models** —
-  runs a bring-up test that takes the SGMII links to LINK UP over
-  cross-looped serial lanes and programs the MACs over AXI4-Lite (§5.4).
+  brings the SGMII links up over the GT serial lanes, programs the MACs
+  over AXI4-Lite, then **pushes real wire frames through the whole BD**
+  from a TB-side PHY partner, checked end to end (§5.4).
 
 | Item | Value |
 |---|---|
@@ -45,7 +46,7 @@ There are **two simulation modes**, each available on both simulators:
 | Frame sizes | 64 B – 9018 B (9000-byte-payload jumbo), MAC jumbo support enabled |
 | Questa result | **PASSED** — 403 frames, 945,639 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~15 s turnaround |
 | XSim result | **PASSED** — 403 frames, 902,859 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~87 s turnaround (§5.3) |
-| Full-BD sim (`--full_sim`) | **PASSED** on both simulators — entire BD incl. GT SecureIP, SGMII links up over serial loopback, 310 affirmations (§5.4) |
+| Full-BD sim (`--full_sim`) | **PASSED** on both simulators — entire BD incl. GT SecureIP: links up, then 40 wire frames through PHY partner → MACs → FIFO, corrupted frames dropped, Frame_Stats matches wire truth (§5.4) |
 
 The design targets the Alinx AXAU15 board's FPGA part but is intended for
 **behavioral simulation + synthesis only** — no pinout, no implementation, no
@@ -65,8 +66,9 @@ bitstream.
    - [3.1 Verification Boundary](#31-verification-boundary)
    - [3.2 Testbench Architecture](#32-testbench-architecture)
    - [3.3 What a Test Run Does](#33-what-a-test-run-does)
-   - [3.4 Result](#34-result)
-   - [3.5 Simulation Artifacts](#35-simulation-artifacts)
+   - [3.4 Result — Datapath Test](#34-result--datapath-test)
+   - [3.5 Result — Full Block-Design Test (--full_sim)](#35-result--full-block-design-test---full_sim)
+   - [3.6 Simulation Artifacts](#36-simulation-artifacts)
 4. [OSVVM Usage and Advantages](#4-osvvm-usage-and-advantages)
    - [4.1 What OSVVM Buys For This Project](#41-what-osvvm-buys-for-this-project)
    - [4.2 Feature-by-Feature](#42-feature-by-feature)
@@ -108,7 +110,9 @@ OS-VVM_Test/
 │       ├── TestCtrl_FrameLoopback.vhd   The datapath test case
 │       ├── TestCtrlFull_e.vhd  Full-BD test-sequencer entity (--full_sim)
 │       ├── TbFullBd.vhd        Full-BD harness (GT SecureIP, serial loopback)
-│       └── TestCtrl_FullBringup.vhd     The full-BD bring-up test case
+│       ├── TestCtrl_FullBringup.vhd     Full-BD bring-up test (reference)
+│       └── TestCtrl_FullTraffic.vhd     The full-BD test: bring-up + wire
+│                                        traffic via the SGMII PHY partner
 └── OSVVM_Ethernet_Sim.*        Vivado project outputs (generated)
 ```
 
@@ -190,9 +194,11 @@ flowchart LR
 ```
 
 Also at the BD boundary: `s_axi_ingress` / `s_axi_egress` (AXI4-Lite
-management ports for each MAC) and `s_axi_stats` (the Frame_Stats register
-port), all associated with the exported `axi_clk_125MHz`, plus
-`system_resetn`, `clocks_locked`, and `sys_clk_in` (200 MHz differential).
+management ports for each MAC), `s_axi_stats` (the Frame_Stats register
+port), and `s_axis_txc` (the egress TX control stream — mandatory for
+transmission, see §2.3), all associated with the exported
+`axi_clk_125MHz`, plus `system_resetn`, `clocks_locked`, and `sys_clk_in`
+(200 MHz differential).
 
 ### 2.2 Data Path
 
@@ -223,7 +229,7 @@ of standard ones).
   and Transmitter Configuration bit 30 — written through the `s_axi_ingress`
   / `s_axi_egress` management ports. The datapath testbench (§3) does not
   touch them (the MACs sit outside its verification boundary), but the
-  full-BD bring-up test (§5.4) **sets and reads back both bits on both
+  full-BD test (§5.4) **sets and reads back both bits on both
   MACs over AXI4-Lite** — so the runtime half of the jumbo story is
   exercised in simulation too, exactly as bring-up software would do it.
 
@@ -231,22 +237,33 @@ The FIFO's `M_AXIS` drives the **egress** MAC's TX client interface
 (`s_axis_txd`), which transmits the frame out of the egress SGMII serial
 lanes. All connectivity between the three blocks is AXI4-Stream.
 
-### 2.3 Deliberately Unconnected Interfaces
+### 2.3 Sideband Interfaces: Unconnected — With One Earned Exception
 
 The demo is a single-direction bridge, and the checksum-offload sideband
 streams are out of scope for the AXIS datapath verification target:
 
 * `Ethernet_MAC_Ingress/m_axis_rxs` — RX status stream (offload metadata)
-* `Ethernet_MAC_Egress/s_axis_txc` — TX control stream (offload directives)
 * The reverse direction (`Ingress/s_axis_txd|txc`, `Egress/m_axis_rxd|rxs`)
 
-In a production bidirectional bridge you would mirror the FIFO for the other
-direction and either drive `s_axis_txc` with proper control words or use the
-full-checksum-offload configuration; for this synthesis-plus-simulation demo
-they are left unconnected (Vivado ties the inputs off). One knock-on effect
-worth knowing: because the client AXIS interfaces are internal to the BD,
-the full-BD simulation (§5.4) has no way to inject frames — which is why it
-is a bring-up/integration test rather than a traffic test.
+These are left unconnected (Vivado ties the inputs off); a production
+bidirectional bridge would mirror the FIFO for the other direction.
+
+**The exception is `Ethernet_MAC_Egress/s_axis_txc`, which is exported at
+the BD boundary** — and the reason is a lesson this project learned the
+expensive way (§7.14): the AXI Ethernet buffer's TX engine requires a
+**6-word control packet per frame** on `s_axis_txc`, and with it
+unconnected the egress MAC never transmits a single beat. The original
+"deliberately unconnected" version of this design passed synthesis and the
+datapath test — which never exercises the egress MAC — and failed only
+when the full-BD traffic test (§5.4) pushed real frames: the packet FIFO
+filled to its full 32 KB while `FRAMES_OUT` sat at zero. At board level,
+the host DMA provides these control words; in the full-BD testbench an
+OSVVM `AxiStreamTransmitter` VVC does.
+
+Frame *injection* still has no client-side path (the AXIS client
+interfaces remain internal), but that stopped being a limitation once the
+full-BD test gained a serial-side PHY partner — traffic now enters the way
+it would on a board: through the SGMII lanes (§5.4).
 
 ### 2.4 Frame_Stats — Register Observability (built on open-logic)
 
@@ -340,7 +357,7 @@ TEMAC/PCS-PMA sub-cores all produce checkpoints in their OOC runs.
 
 This section describes the **datapath testbench** — the coverage-driven
 constrained-random test that is the project's primary verification vehicle.
-The second testbench, the full-BD bring-up test behind `--full_sim`, is
+The second testbench, the full-BD traffic test behind `--full_sim`, is
 described in §5.4; the boundary discussion below explains why the two exist
 and how they divide the work.
 
@@ -488,7 +505,11 @@ A 2000-frame safety cap raises an `Alert` (test FAILs) if coverage ever
 stops closing — "we ran the cases we thought of" is replaced by a
 machine-checked completion criterion.
 
-### 3.4 Result
+### 3.4 Result — Datapath Test
+
+Produced by the **default** flow (`./run_sim.sh --batch`, or `tclsh
+run_sim.tcl` on XSim) — the coverage-driven frame test described above.
+The full-BD `--full_sim` run prints something quite different; see §3.5.
 
 ```
 %% WriteBin: FrameLength
@@ -531,7 +552,66 @@ On Questa, 403 frames close all coverage in ~4.4 ms of simulated time (~11 s
 wall clock); on XSim the different seed path closes coverage too (see the
 results table).
 
-### 3.5 Simulation Artifacts
+### 3.5 Result — Full Block-Design Test (`--full_sim`)
+
+`--full_sim` elaborates a **different testbench** (`TbFullBd` /
+`TestCtrl_FullTraffic`, test name `TbFullBd_FullTraffic`, §5.4): it brings
+the whole BD up — GT SecureIP serial links included — and then **pushes
+real wire frames through it** from a TB-side SGMII PHY partner, checking
+them at the far end and against Frame_Stats. Produced by
+`./run_sim.sh --full_sim --batch` (Questa) or `tclsh run_sim.tcl
+-full_sim` (XSim):
+
+```
+%%     508.75 ns  INFO    clocks_locked asserted at 508750 ps
+%%     980.50 ns  INFO    Frame_Stats MAGIC verified over AXI4-Lite
+%%  92780.50 ns  PASSED  Ingress SGMII link UP through GT serial (0 polls)
+%% 110556.50 ns  PASSED  Egress SGMII link UP through GT serial (0 polls)
+%% 110556.50 ns  PASSED  PHY partner link UP (status_vector(0), 0 polls)
+%% 111228.50 ns  INFO    Jumbo (JUM) bits set and verified on both MACs
+%% 111396.50 ns  INFO    Ingress MAC promiscuous mode enabled (AFM bit 31)
+%% 111396.50 ns  INFO    Starting wire traffic: 40 constrained-random frames
+%% 719040.41 ns  INFO    GmiiTxProc: sent 40 wire frames (33 clean),
+%%                       wrote TbFullBd_FullTraffic_tx.pcap
+%% 732704.41 ns  PASSED  Clean frames received at partner GMII Received : 33
+%% 733028.50 ns  INFO    Frame_Stats counters match wire truth
+%%                       (33 frames, 46196 client bytes)
+%% FRAME_STATS_DUMP MAGIC      = 0x46535431 (1179866161)
+%% FRAME_STATS_DUMP FRAMES_IN  = 0x00000021 (33)
+%% FRAME_STATS_DUMP FRAMES_OUT = 0x00000021 (33)
+%% FRAME_STATS_DUMP BYTES_IN   = 0x0000B474 (46196)
+%% FRAME_STATS_DUMP BYTES_OUT  = 0x0000B474 (46196)
+%% FRAME_STATS_DUMP STALL_IN   = 0x00000000 (0)
+%% FRAME_STATS_DUMP STALL_OUT  = 0x00000007 (7)
+%% 733340.50 ns  DONE  PASSED  TbFullBd_FullTraffic
+%%               Passed: 46682  Affirmations Checked: 46682
+```
+
+Three things in that output worth reading twice, all correct:
+
+* **Only 33 of the 40 frames arrive.** The other 7 carried injected FCS
+  errors, and the ingress TEMAC *drops* bad-FCS frames — real MAC
+  behavior. The scoreboard holds clean frames only, so an errored frame
+  leaking through (or a clean one going missing) fails the test.
+* **No coverage report.** The traffic set is a fixed 40-frame,
+  corner-pinned sample (64/1518/9018 guaranteed) sized for wire-speed
+  simulation cost — coverage-closure stimulus lives in the datapath test
+  (§3.4), which pushes 10× the frames in a fraction of the wall time.
+* **The byte counters are FCS-less and the stall counter is tiny but
+  real.** `BYTES_IN/OUT` count *client* bytes (the TEMAC strips the FCS
+  before the FIFO ever sees it: 46,196 = Σ(frame − 4)), and
+  `STALL_OUT = 7` is genuine egress-MAC backpressure, not testbench
+  artifice.
+
+The artifacts also land somewhere else: `--full_sim` runs from the
+Vivado-generated script directory, so its transcript is
+`OSVVM_Ethernet_Sim.sim/sim_1/behav/questa/OsvvmTemp_Questa/TbFullBd_FullTraffic.log`
+(XSim: `.../behav/xsim/OsvvmTemp_XSIM/...`), with the raw console output
+in `full_sim.log` and the wire-frame capture
+`TbFullBd_FullTraffic_tx.pcap` beside it — not under `sim/` where the
+datapath artifacts appear. See §3.6.
+
+### 3.6 Simulation Artifacts
 
 Every run leaves reviewable evidence behind. What, where, and what it is
 good for:
@@ -539,9 +619,9 @@ good for:
 | Artifact | Where (Questa / XSim) | Contents |
 |---|---|---|
 | OSVVM transcript | `sim/OsvvmTemp_Questa/<TestName>.log` / `sim/xsim_work/OsvvmTemp_XSIM/<TestName>.log` | Every log line and affirmation of the run, in time order (`--full_sim` equivalents live next to the exported scripts) |
-| Frame capture (PCAP) | `sim/TbEthernetFifo_FrameLoopback_tx.pcap` / `sim/xsim_work/...same name` | Every transmitted frame — see below |
+| Frame capture (PCAP) | datapath: `sim/TbEthernetFifo_FrameLoopback_tx.pcap` (XSim: under `sim/xsim_work/`); full-sim: `TbFullBd_FullTraffic_tx.pcap` next to the exported scripts | Every transmitted frame — see below |
 | Register dump | inside the transcripts | `FRAME_STATS_DUMP` lines — see below |
-| OSVVM reports | YAML + HTML next to the transcripts | Alert/coverage/scoreboard accounting for CI dashboards |
+| OSVVM reports | YAML + HTML next to the transcripts | Alert/coverage/scoreboard accounting for CI dashboards — guided tour below |
 | Waveforms | `sim/vsim.wlf` / `sim/xsim_work/*.wdb` | Signal history — full-design depth in detailed mode (§5.1/§5.2) |
 
 **Frame capture (PCAP).** The transmitter writes **every generated frame
@@ -594,6 +674,42 @@ observation, the `--detailed` Questa mode and the XSim `-gui` mode both
 include the six counters in their wave sets (radix unsigned), so you can
 watch `FramesIn`/`BytesOut`/`StallOut` step in real time against the AXIS
 traffic that causes them.
+
+**The OSVVM record tree — a guided tour of all that YAML.** OSVVM leaves
+a lot of files behind, and they are not noise: every one is a structured,
+machine-readable record with a distinct job, written by two different
+layers. The *VHDL* layer (`EndOfTestReports`) writes the per-test records
+into `OsvvmTemp_<tool>/`: `<TestName>_alerts.yml` is the full **AlertLog
+hierarchy** — total error/affirmation counts, then per-source children
+(`Default` for the test's own checks, each scoreboard and coverage model,
+each VVC by name), so a failure is attributable to a *component* without
+reading the transcript; `<TestName>_cov.yml` is the complete **coverage
+database** — per-model goals, weight/count modes, per-bin counts, and
+crucially the **randomization seeds**, which is what makes any past run
+exactly reproducible; `<TestName>_sb_slv.yml` is the **scoreboard
+accounting** (items pushed/checked/popped/remaining — `FifoCount: 0`
+everywhere is the "nothing left in flight" proof); and `OsvvmRun.yml` is
+the **append-only run history** — one record per `EndOfTestReports` with
+status, coverage percentage, simulated time, and the results one-liner,
+accumulating across runs so regressions can be trended without keeping
+transcripts. The *scripting* layer (the OSVVM `build` command that
+compiles the libraries, §5) writes the build-level records at the top of
+`sim/`: `index.yml`/**`index.html`** — the **"Index of Builds" page that
+governs the tree** — linking one report per build
+(`osvvm/osvvm.html`, `Common_build/Common_build.html`,
+`AXI4_build/AXI4_build.html`), each with its HTML-ified compile log under
+`<build>/logs/`. Three specific files worth opening: **`sim/index.html`**
+in a browser for the governed view, **`sim/OsvvmTemp_Questa/
+TbEthernetFifo_FrameLoopback_cov.yml`** to see what a closed coverage
+model actually records (find `Seeds:`), and
+**`..._alerts.yml`** to see the per-VVC attribution tree. One honest
+caveat: because this project's test runs bypass the OSVVM scripting
+environment (§5), the *test* YAMLs are not automatically rendered to
+HTML — that transformation belongs to OSVVM's scripted regression flow
+(`RunTest`/`build`), which is the natural next step for a team adopting
+this in CI; the YAML is already in exactly the shape that flow consumes.
+(`--full_sim` equivalents of all per-test records live in
+`OsvvmTemp_<tool>/` next to the exported scripts, §3.5.)
 
 ---
 
@@ -770,20 +886,72 @@ silently falls back to editing the Questa *installation's* `modelsim.ini`
 
 ### 5.2 Vivado Simulator (XSim)
 
-The identical test also runs on XSim via `sim/run_sim.tcl` — any of:
+The identical test also runs on XSim via `sim/run_sim.tcl`, which accepts
+three options:
+
+| Option | Effect |
+|---|---|
+| `-gui` | Launch the xsim GUI with the wave set preloaded, instead of a headless run |
+| `-detailed` | With `-gui`: log **every** design object to the waveform database (bigger `.wdb`, whole design browsable afterwards) |
+| `-full_sim` | Run the **full block design** bring-up + wire-traffic test (both Ethernet subsystems incl. GT SecureIP) instead of the datapath test — see §5.4 |
+
+They combine freely (`-full_sim -gui -detailed` is valid). How you pass
+them depends on how you start the script:
+
+**From the Vivado TCL console.** `source` accepts no arguments, so set the
+options in the global `::RUN_SIM_ARGS` *before* sourcing:
 
 ```tcl
-# From the Vivado TCL console:
-cd {path/to/OS-VVM_Test/sim} ; source run_sim.tcl
+cd {/media/fpgadev/Dev_Tools/Work/OS-VVM_Test/sim}
+
+source run_sim.tcl                          ;# default: datapath test, headless
+
+set ::RUN_SIM_ARGS {-gui}                   ;# datapath test in the xsim GUI
+source run_sim.tcl
+
+set ::RUN_SIM_ARGS {-full_sim}              ;# full BD incl. GT SecureIP
+source run_sim.tcl
+
+set ::RUN_SIM_ARGS {-full_sim -gui}         ;# full BD, GUI, waves preloaded
+source run_sim.tcl
+
+unset ::RUN_SIM_ARGS                        ;# back to a plain default run
 ```
+
+`::RUN_SIM_ARGS` **persists for the rest of the session**, so a later
+`source run_sim.tcl` reuses whatever is still set — `unset` it (or assign a
+new list) when you want something different. The script echoes
+`run_sim.tcl: options: …` at startup so the active options are always
+visible in the console.
+
+**From the Vivado command line** — options go after `-tclargs`:
+
 ```bash
-# From the Vivado command line:
-vivado -mode batch -source sim/run_sim.tcl
-# Or standalone (resolves xvhdl/xelab/xsim from XILINX_VIVADO or the install):
-tclsh sim/run_sim.tcl
-# GUI with AXIS waves:
-tclsh sim/run_sim.tcl -gui
+vivado -mode batch -source sim/run_sim.tcl                          # default
+vivado -mode batch -source sim/run_sim.tcl -tclargs -full_sim       # full BD
+vivado -mode batch -source sim/run_sim.tcl -tclargs -gui -detailed
 ```
+
+**Standalone**, with no Vivado session at all (xsim tools resolved from the
+install or `XILINX_VIVADO`) — options are plain arguments:
+
+```bash
+tclsh sim/run_sim.tcl
+tclsh sim/run_sim.tcl -full_sim
+tclsh sim/run_sim.tcl -gui -detailed
+```
+
+A note on `-gui` from **batch** invocations: the GUI is launched as a
+detached process, so it is only useful from the interactive console (or
+`tclsh`) — in `-mode batch` Vivado may exit and take the viewer with it.
+For batch runs, prefer `-detailed` and open the resulting `.wdb` afterwards.
+
+`-full_sim` on XSim needs **no** extra setup: XSim ships its Xilinx
+libraries with Vivado, so this flow exports only its own simulation
+scripts and never requires the precompiled Questa libraries (or
+`QUESTA_COMPILED_LIB_DIR`) that the Questa full-BD flow depends on — see
+§5.4. The first `-full_sim` run exports those scripts automatically,
+which takes an extra minute or two.
 
 It checks that the Vivado project has been built, compiles the OSVVM
 libraries with OSVVM's own XSim vendor scripts (`StartXSIM.tcl`, cached
@@ -840,10 +1008,13 @@ that mode's description, in §5.4.)
 ### 5.4 Full Block-Design Simulation (--full_sim)
 
 Both launchers accept a **`--full_sim`** switch that simulates the **entire
-block design** instead of the FIFO-datapath testbench — both AXI 1G/2.5G
-Ethernet Subsystems in their entirety (TEMAC, SGMII PCS/PMA, and the **GT
-transceivers as encrypted SecureIP models**), the clock wizard, reset
-block, packet FIFO, and Frame_Stats:
+block design** — both AXI 1G/2.5G Ethernet Subsystems in their entirety
+(TEMAC, SGMII PCS/PMA, and the **GT transceivers as encrypted SecureIP
+models**), the clock wizard, reset block, packet FIFO, and Frame_Stats —
+and runs a **bring-up-then-traffic test**: after the links come up, real
+constrained-random Ethernet frames (64 B to 9018 B jumbo, ~1 in 6
+FCS-corrupted) enter the UUT **through the SGMII serial lanes**, traverse
+ingress MAC → FIFO → egress MAC, and are checked at the far end:
 
 ```bash
 ./run_sim.sh --full_sim --batch        # Questa
@@ -861,22 +1032,33 @@ interfaces are internal, §2.3); with `--detailed` every design object is
 additionally logged so the whole BD is browsable after the run.
 
 **What runs.** The harness (`tb/TbFullBd.vhd`) provides board-level wiring:
-200 MHz system clock, 125 MHz GT reference clocks, reset, MDIO pull-ups,
-and — the interesting part — an **SGMII serial cross-loopback** (each MAC's
-GT TX lanes feed the other MAC's GT RX lanes). Three `CsrAxiLiteManager`
-VVCs drive the exported AXI4-Lite ports:
+200 MHz system clock, 125 MHz GT reference clocks, reset, MDIO pull-ups —
+and a **TB-side SGMII PHY partner**: a standalone `gig_ethernet_pcs_pma`
+core (same proven configuration as the ones inside the subsystems, AN
+disabled at generation) whose **GMII is the traffic injection and
+extraction point**. The serial lanes form a **chain** so every receiver
+has a live link partner and traffic traverses the whole UUT:
+partner TX → ingress RX (frames in), ingress TX → egress RX (idles),
+egress TX → partner RX (frames out, checked). Three `CsrAxiLiteManager`
+VVCs drive the AXI4-Lite ports, and a fourth VVC — an OSVVM
+`AxiStreamTransmitter` on the exported `s_axis_txc` — plays the host DMA,
+supplying the TX control packet the egress MAC requires per frame (§2.3):
 
 ```mermaid
 flowchart TB
     subgraph HARNESS["TbFullBd (OSVVM test harness)"]
-        subgraph SEQ["TestCtrlFull (FullBringup)"]
-            MAIN["MainProc\nbring-up sequence:\nMAGIC, MDIO, AN off,\nlink-up polls, JUM bits"]
-            CTRL["ControlProc\nAlertLog, transcript,\n10 ms watchdog,\nEndOfTestReports"]
+        subgraph SEQ["TestCtrlFull (FullTraffic)"]
+            MAIN["MainProc\nbring-up: MAGIC, MDIO,\nAN off, links up, JUM,\npromiscuous; then traffic\ncontrol + Frame_Stats checks"]
+            GTX["GmiiTxProc\nconstrained-random wire\nframes + PCAP + scoreboard"]
+            GRX["GmiiRxProc\nbyte checks + FCS\nre-validation"]
+            CTRL["ControlProc\nAlertLog, transcript,\n50 ms watchdog,\nEndOfTestReports"]
         end
-        CLKGEN["Board stimulus\n200 MHz sys clk (diff)\n125 MHz GT refclk (diff)\nsystem_resetn, MDIO pull-ups"]
+        CLKGEN["Board stimulus\n200 MHz sys clk, 125 MHz GT\nrefclk, 50 MHz indep clk,\nsystem_resetn, MDIO pull-ups"]
         IVVC["CsrAxiLiteManager\nIngressMacCsr"]
         EVVC["CsrAxiLiteManager\nEgressMacCsr"]
         SVVC["CsrAxiLiteManager\nFrameStatsCsr"]
+        TXCVVC["AxiStreamTransmitter\n(TX control packets,\nhost-DMA stand-in)"]
+        PARTNER["SGMII PHY partner\ngig_ethernet_pcs_pma\n+ GT (SecureIP), AN off"]
 
         subgraph UUT["UUT: Top_wrapper -- the COMPLETE block design"]
             CLK["System_Clock (clk_wiz)\n+ AXI_Reset (proc_sys_reset)"]
@@ -898,17 +1080,23 @@ flowchart TB
     MAIN -- "IngressRec (OSVVM MIT)" --> IVVC
     MAIN -- "EgressRec" --> EVVC
     MAIN -- "StatsRec" --> SVVC
+    GTX -- "TxcRec" --> TXCVVC
+    GTX -- "GMII TX\n(preamble+frame+FCS)" --> PARTNER
+    PARTNER -- "GMII RX" --> GRX
     IVVC -- "AXI4-Lite\ns_axi_ingress" --> TEMACI
     EVVC -- "AXI4-Lite\ns_axi_egress" --> TEMACE
     SVVC -- "AXI4-Lite\ns_axi_stats" --> STATS
+    TXCVVC -- "s_axis_txc\n(6-word ctrl/frame)" --> TEMACE
     CLKGEN --> CLK
+    CLKGEN --> PARTNER
     TEMACI -. "MDIO" .- PCSI
     TEMACE -. "MDIO" .- PCSE
     PCSI --- GTI
     PCSE --- GTE
-    GTI == "serial TX -> RX" ==> GTE
-    GTE == "serial TX -> RX" ==> GTI
-    TEMACI -- "RX client AXIS" --> FIFO
+    PARTNER == "serial: frames in" ==> GTI
+    GTI == "serial: idles" ==> GTE
+    GTE == "serial: frames out" ==> PARTNER
+    TEMACI -- "RX client AXIS\n(clean frames only)" --> FIFO
     FIFO -- "AXIS" --> TEMACE
     FIFO -. "monitor taps" .-> STATS
 ```
@@ -921,90 +1109,123 @@ contexts:
 | TbFullBd -- OSVVM stimulus infrastructure around the UUT (--full_sim)      |
 |                                                                            |
 | +------------------------------------------------------------------------+ |
-| | TestCtrlFull / FullBringup  --  the test sequencer                     | |
-| |  MainProc   : MAGIC check -> MDIO bring-up -> AN off -> link-up        | |
-| |               polls -> JUM bits set + readback -> counters zero        | |
-| |  ControlProc: AlertLog, 10 ms watchdog, EndOfTestReports               | |
+| | TestCtrlFull / FullTraffic  --  the test sequencer                     | |
+| |  MainProc  : bring-up (MAGIC, MDIO, AN off, links up, JUM,             | |
+| |              promiscuous) -> traffic ctrl -> Frame_Stats checks        | |
+| |  GmiiTxProc: random wire frames + PCAP    GmiiRxProc: checks           | |
+| |  ControlProc: AlertLog, 50 ms watchdog, EndOfTestReports               | |
 | +------------------------------------------------------------------------+ |
-|          | IngressRec                | StatsRec                | EgressRec |
-|          v  (OSVVM MIT records)      v                         v           |
-|  +---------------+           +---------------+         +---------------+   |
-|  | CsrAxiLite    |           | CsrAxiLite    |         | CsrAxiLite    |   |
-|  | Manager VVC   |           | Manager VVC   |         | Manager VVC   |   |
-|  +---------------+           +---------------+         +---------------+   |
-|          | AXI4-Lite       AXI4-Lite |              AXI4-Lite  |           |
-|          | s_axi_ingress s_axi_stats |            s_axi_egress |           |
-|+=========v===========================v=========================v==========+|
-|| +-----------------+         +---------------+        +-----------------+ ||
-|| | Ethernet MAC    |         | Frame_Stats   |        | Ethernet MAC    | ||
-|| | INGRESS         |         | counters +    |        | EGRESS          | ||
-|| | TEMAC + MDIO    |         | olo_axi_lite  |        | TEMAC + MDIO    | ||
-|| | SGMII PCS/PMA   |         | _slave        |        | SGMII PCS/PMA   | ||
-|| | GT (SecureIP)   |         +---------------+        | GT (SecureIP)   | ||
-|| +-----------------+                 :  monitor taps  +-----------------+ ||
-||    | m_axis_rxd (RX client AXIS)    :                         ^          ||
-||    |                      +-------------------+               |          ||
-||    +--------------------->| Axis_Frame_Fifo   |               |          ||
-||                           | 8192 x 32 words   |---------------+          ||
-||                           | packet mode (S&F) | s_axis_txd (TX client)   ||
+|          | IngressRec                | StatsRec      |  EgressRec |        |
+|          v  (OSVVM MIT records)      v        TxcRec |            v        |
+|  +---------------+           +---------------+       |    +---------------+|
+|  | CsrAxiLite    |           | CsrAxiLite    |       |    | CsrAxiLite    ||
+|  | Manager VVC   |           | Manager VVC   |       |    | Manager VVC   ||
+|  +---------------+           +---------------+       |    +---------------+|
+|          |                           |       +---------------+    |        |
+|          |                           |       | AxiStream     |    |        |
+|          |                           |       | Tx VVC (txc)  |    |        |
+|          |                           |       +---------------+    |        |
+|          | AXI4-Lite      AXI4-Lite  |    s_axis_txc |  AXI4-Lite |        |
+|          | s_axi_ingress s_axi_stats |               |s_axi_egress|        |
+|+=========v===========================v===============v============v=======+|
+||         |                           |               |            |       ||
+|| +-----------------+         +---------------+      +-----------------+   ||
+|| | Ethernet MAC    |         | Frame_Stats   |      | Ethernet MAC    |   ||
+|| | INGRESS         |         | counters +    |      | EGRESS          |   ||
+|| | TEMAC + MDIO    |         | olo_axi_lite  |      | TEMAC + MDIO    |   ||
+|| | SGMII PCS/PMA   |         | _slave        |      | SGMII PCS/PMA   |   ||
+|| | GT (SecureIP)   |         +---------------+      | GT (SecureIP)   |   ||
+|| +-----------------+                 :  monitor taps+-----------------+   ||
+||    | RX client AXIS (clean only)    :                    ^               ||
+||    |                      +-------------------+          |               ||
+||    +--------------------->| Axis_Frame_Fifo   |---------+                ||
+||                           | 8192 x 32 words   | s_axis_txd (TX client)   ||
+||                           | packet mode (S&F) |                          ||
 ||                           +-------------------+                          ||
 ||                  UUT: Top_wrapper -- the COMPLETE block design           ||
 |+==========================================================================+|
-|   sgmii_ingress serial lanes                  sgmii_egress serial lanes    |
-|     TX >--------------- cross-loopback --------------> RX                  |
-|     RX <--------------- cross-loopback ---------------- TX                 |
+|     ^     | frames in                     idles in      ^         |        |
+|     |     +--------------- ingress TX -> egress RX -----+         |        |
+|     |   frames out of egress TX                                   v        |
+|  +----------------------------------------------------------------------+  |
+|  | serial TX    SGMII PHY PARTNER (pcs_pma + GT, AN off)    serial RX   |  |
+|  +----------------------------------------------------------------------+  |
+|     |  GMII TX in: GmiiTxProc (wire frames)     |  GMII RX out: GmiiRxProc |
 |                                                                            |
-| Board stimulus from the harness: 200 MHz sys clk (diff) + system_resetn,   |
-| 125 MHz GT refclk (diff, both MACs), MDIO pull-ups. The UUT returns        |
-| axi_clk_125MHz, which clocks the three VVCs.                               |
+| Board stimulus: 200 MHz sys clk + resetn, 125 MHz GT refclk, 50 MHz        |
+| independent clock; the UUT returns axi_clk_125MHz for the VVC clocks       |
 +----------------------------------------------------------------------------+
 ```
 
-The serial cross-loopback (thick arrows) is what makes link-up a real
-test of the GT SecureIP models: each PCS/PMA's data travels through its
-own GT TX serializer, over the modeled lanes, and through the *other*
-MAC's GT RX — CDR, comma alignment and 8b/10b sync all do real work. The
-bring-up test (`tb/TestCtrl_FullBringup.vhd`):
+Every serial hop is a GT SecureIP TX/RX pair doing real work — CDR lock,
+comma alignment, 8b/10b — and the traffic itself rides those hops. The
+test (`tb/TestCtrl_FullTraffic.vhd`):
 
 1. waits for `clocks_locked` and verifies the Frame_Stats MAGIC register;
 2. brings up the TEMAC MDIO masters and talks to the internal SGMII
    PCS/PMA cores (PHY address 1), retrying until the GT-derived clocks are
    alive;
-3. disables PCS/PMA autonegotiation via MDIO (both ends are MAC-mode SGMII
-   cores — there is no PHY-side partner to serve SGMII config words);
-4. polls both links to **LINK UP through the GT SecureIP serial path** —
-   real CDR lock, comma alignment and 8b/10b sync over the cross-looped
-   lanes;
+3. disables PCS/PMA autonegotiation via MDIO (the TB partner was generated
+   with AN off, so all three links come up on 8b/10b sync alone);
+4. polls all three links to **LINK UP through the GT SecureIP serial
+   path** — the two MACs via MDIO status, the partner via its
+   `status_vector`;
 5. sets and reads back the **runtime jumbo bits** (RCW1.JUM / TC.JUM,
-   bit 30) on both MACs — the second half of the jumbo story from §2.2;
-6. confirms the Frame_Stats counters are zero (no client traffic exists at
-   BD level) and ends with `EndOfTestReports` → `DONE PASSED`/`FAILED`.
+   bit 30) on both MACs — the second half of the jumbo story from §2.2 —
+   and enables **promiscuous mode** on the ingress MAC (the random DAs
+   would otherwise be address-filtered);
+6. **pushes 40 constrained-random wire frames** (64 B–9018 B, pinned
+   corners at 64/1518/9018, ~1 in 6 FCS-corrupted) into the partner GMII,
+   writing every frame to a fresh PCAP; per clean frame, the txc VVC
+   supplies the egress MAC's 6-word TX control packet;
+7. checks at the partner GMII RX: the ingress MAC must **drop every
+   corrupted frame** (real MAC behavior — the scoreboard holds clean
+   frames only) and deliver every clean frame **byte-identical** (the
+   egress MAC's regenerated FCS equals the original), each frame's FCS
+   independently re-validated;
+8. cross-checks **Frame_Stats against wire truth**: `FRAMES_IN/OUT` must
+   equal the clean-frame count and `BYTES_IN/OUT` the client byte count —
+   register observability of *real traffic through AMD's own MACs* — then
+   dumps all registers (`FRAME_STATS_DUMP`) and ends with
+   `EndOfTestReports` → `DONE PASSED`/`FAILED`.
 
-Frame *injection* is deliberately impossible in this configuration: the
-MAC client AXIS interfaces are internal to the BD (§2.3), so the full sim
-verifies **integration and bring-up** — clocking, resets, management
-plane, and the physical serial path — while the default fast sim verifies
-the **datapath**. They complement each other; neither replaces the other.
+The wait for traffic completion is **progress-based** (a 2 ms window with
+no newly received frame = stall), not a flat timeout — see §7.14 for the
+expensive lesson behind that. The datapath test (§3) remains the
+exhaustive frame-level workout of the project-authored logic at
+per-commit speed; the full-BD test proves the same system **end to end
+through the real MACs at wire speed** — bring-up, management plane,
+serial path, MAC frame policies, and Frame_Stats measuring live traffic.
+(The original bring-up-only test case, `tb/TestCtrl_FullBringup.vhd`,
+remains in the tree as a reference architecture; the harness binds
+`FullTraffic`.)
 
-**Results and benchmark.** Both simulators report `DONE PASSED` with 310
-affirmations on the identical test — links up through GT SecureIP at
-~93 µs and ~111 µs simulated. Measured under the same conditions as the
-§5.3 datapath benchmark (same machine, warm caches — scripts exported, BD
-previously compiled so recompiles are incremental — single timed batch run
-of each launcher):
+**Results and benchmark.** Both simulators report `DONE PASSED`
+(annotated sample output: §3.5). Each walks its own seed path — Questa's
+40 frames came out 33 clean / 7 corrupted (46,682 affirmations, 733 µs
+simulated), XSim's 36 / 4 (55,993 affirmations, 894 µs) — and each run's
+Frame_Stats counters match *that run's* wire truth, which is the
+cross-simulator diversity working as intended. Measured under the same
+conditions as the §5.3 datapath benchmark (same machine, warm caches —
+scripts exported, BD previously compiled so recompiles are incremental —
+single timed batch run of each launcher):
 
 | Phase | Questa | XSim |
 |---|---|---|
-| BD (incremental) + TB compile + elaborate | ~11 s | ~61 s |
-| Simulation execution | ~10 s | ~37 s |
-| **Total turnaround (warm)** | **21.5 s** | **98 s** |
-| Affirmations checked | 310 | 310 |
-| Simulated time | 111.3 µs | 111.3 µs |
+| BD (incremental) + partner + TB compile + elaborate | ~13 s | ~2 min |
+| Simulation execution | ~75 s | ~354 s |
+| **Total turnaround (warm)** | **1 m 28 s** | **7 m 53 s** |
+| Affirmations checked | 46,682 | 55,993 |
+| Simulated time | 733 µs | 894 µs |
+| Wire frames (clean/total) | 33/40 | 36/40 |
 
-The shape matches the datapath benchmark: XSim's raw simulation speed
-holds within ~4× of Questa even with GT SecureIP active — SecureIP is
-remarkably cheap at this activity level — but its full re-elaboration on
-every invocation dominates the turnaround (~4.5× total). A first-ever
+This is the promised **longer run time, validated**: wire traffic at
+1 Gb/s through GT SecureIP dominates — the simulation phase grew from
+~10 s (bring-up only) to ~75 s on Questa and from ~37 s to ~6 min on
+XSim, and the cost scales with the byte volume of the traffic set
+(40 frames ≈ 50–60 KB of wire data). The intended cadence follows from
+that: the datapath test (§5.3, ~15 s) is the per-commit gate; the full-BD
+traffic test is the on-demand/nightly integration proof. A first-ever
 `--full_sim` run additionally pays the one-time script export plus the
 full (non-incremental) BD compile — a few minutes on either simulator —
 and on Questa requires the precompiled libraries described below.
@@ -1033,9 +1254,11 @@ project settings — `target_simulator` and the `sim_1` top — it prints a
 notice when it does.)
 
 **Precompiled simulation libraries.** XSim ships its Xilinx libraries with
-Vivado; **Questa needs a one-time `compile_simlib` run**, and the flow
-finds it through a **required environment variable** — no path is baked
-into the scripts:
+Vivado, so **the XSim `-full_sim` flow needs nothing extra** — it exports
+only its own scripts (`FULL_SIM_EXPORT_SIMS=xsim`) and never touches the
+Questa libraries. **Questa needs a one-time `compile_simlib` run**, and
+that flow finds it through a **required environment variable** — no path
+is baked into the scripts:
 
 ```bash
 export QUESTA_COMPILED_LIB_DIR=/path/to/compile_simlib/output
@@ -1054,9 +1277,9 @@ compile_simlib -simulator questa -simulator_exec_path $::env(QUESTA_HOME)/bin \
   -directory $::env(QUESTA_COMPILED_LIB_DIR)
 ```
 
-The variable is only consulted when the simulation scripts are (re)exported
-— an already-exported script set carries the resolved paths, so day-to-day
-runs do not need it.
+The variable is only consulted when the **Questa** simulation scripts are
+(re)exported — an already-exported script set carries the resolved paths,
+so day-to-day runs do not need it, and XSim-only users never do.
 
 That produces ~480 libraries (unisim, secureip, xpm, and every IP static
 library — the full-BD sim links against ~20 of them) plus a `modelsim.ini`
@@ -1149,21 +1372,7 @@ environment*:
    Fix: stamp `FREQ_HZ` on the boundary ports and export the 125 MHz clock
    as `axi_clk_125MHz` with `ASSOCIATED_BUSIF {s_axi_ingress:s_axi_egress}`.
 
-3. **`axi_ethernet` reports `REQUIRES_LICENSE = 1`.** Historically the TEMAC
-   was a paid core; since Vivado 2022.1 the license is bundled. Confirmed
-   empirically: both subsystems (TEMAC + PCS/PMA OOC runs included)
-   synthesize to completion on a stock 2026.1 install with no license error.
-
-4. **Verification boundary for the coverage run.** Full-BD simulation would
-   drag in GT SecureIP, autonegotiation time, and MAC register bring-up to
-   verify AMD's own IP. Decision: verify the project-authored datapath (the
-   exact generated FIFO netlist) at the MAC client-stream boundaries with
-   AxiStream VVCs standing in for the MACs (§3.1). This is a deliberate,
-   documented scoping decision, not an accident — and it was later
-   *complemented*, not reversed, by the `--full_sim` bring-up mode (§5.4),
-   which simulates exactly the region this decision excluded.
-
-5. **Partial final words (`tkeep`) through a Verilog DUT.** Ethernet frame
+3. **Partial final words (`tkeep`) through a Verilog DUT.** Ethernet frame
    lengths are rarely multiples of 4, so the last AXIS beat has inactive
    byte lanes, which the Verilog FIFO model drives as X. Verified before
    writing the TB that the OSVVM `AxiStreamReceiver` byte-burst mode derives
@@ -1172,19 +1381,12 @@ environment*:
    scoreboard. `TSTRB` on the receive side mirrors `TKEEP` since the FIFO
    does not carry a strobe.
 
-6. **Avoiding the full `compile_simlib` flow (datapath mode).** The FIFO
-   Generator's behavioral model needs only XPM + `glbl`, both compiled
-   directly from the Vivado install tree in seconds — no precompiled
-   simulator library installation required for the datapath DUT. (The
-   `--full_sim` mode on Questa is the exception: GT SecureIP exists only
-   precompiled, so it needs the one-time `compile_simlib` products — §5.4.)
-
-7. **One-command-but-cached OSVVM build.** OSVVM's scripts recompile
+4. **One-command-but-cached OSVVM build.** OSVVM's scripts recompile
    everything on every `build`; guarded in `compile.do` by the presence of
    `VHDL_LIBS/` plus the persisted `modelsim.ini` mappings, cutting rerun
    time from minutes to ~3 seconds total.
 
-8. **XSim vs. OSVVM singleton constants (the big one).** The first XSim run
+5. **XSim vs. OSVVM singleton constants (the big one).** The first XSim run
    crashed at time 0 with `Attempting to dereference a null access value`.
    Bisected with seven minimal probes: OSVVM scoreboards/coverage/alerts
    alone pass; the AxiStream VVC pair alone passes; combining VVCs with
@@ -1198,7 +1400,7 @@ environment*:
    barrier. Identical behavior on Questa; both simulators now pass the same
    test.
 
-9. **BD monitor taps from RTL module references.** `X_INTERFACE_MODE
+6. **BD monitor taps from RTL module references.** `X_INTERFACE_MODE
    "monitor"` in the VHDL correctly infers monitor-mode AXIS interfaces, but
    connecting them takes the pin-to-master-endpoint form
    (`connect_bd_intf_net [master pin] [monitor pin]`); the documented-looking
@@ -1211,7 +1413,7 @@ environment*:
    interfaces with no TDATA port additionally need an explicit
    `TDATA_NUM_BYTES` interface parameter to keep BD validation quiet.
 
-10. **XSim vs. the Axi4Lite VVC's record bus port.** The stock
+7.  **XSim vs. the Axi4Lite VVC's record bus port.** The stock
     `Axi4LiteManager` connects to its bus through a resolved
     `Axi4LiteRecType` inout record port. Under XSim 2026.1, driver
     contributions on subelements of that record arrive corrupted — reads
@@ -1224,7 +1426,7 @@ environment*:
     AXI4-Lite bus ports — the test sequencer is unchanged, and both
     simulators pass.
 
-11. **`vmap` silently polluted the Questa installation.** With no
+8.  **`vmap` silently polluted the Questa installation.** With no
     `./modelsim.ini` in `sim/` and no `MODELSIM` environment variable, every
     `vmap` in the flow — including the ones inside OSVVM's own library build
     — fell back to modifying the Questa *install's* global `modelsim.ini`,
@@ -1237,7 +1439,7 @@ environment*:
     reused. If this flow ran on your machine before the fix, check the
     install's `modelsim.ini` for those stale entries and delete them.
 
-12. **Full-BD bring-up gotchas (--full_sim).** Three found while making
+9.  **Full-BD bring-up nonsense (--full_sim).** Three found while making
     the full simulation pass. (a) *MDC has a simulation speed limit too*:
     the TEMAC MDIO master completes a frame only after the PCS/PMA slave —
     which samples MDC synchronously in the 50 MHz `independent_clock`
@@ -1263,7 +1465,7 @@ environment*:
     AlertLog tree — the full-BD test paces its polling instead of
     quieting VVC logs.
 
-13. **Transcript and logging volume at jumbo scale.** Moving from 1518-byte
+10. **Transcript and logging volume for jumbo frames.** Moving from 1518-byte
     to 9018-byte maximum frames multiplied the byte volume by ~10×: the
     first jumbo run produced a 44 MB transcript, dominated by two per-word
     log sources — the AxiStream VVCs log every stream beat at INFO
@@ -1273,6 +1475,27 @@ environment*:
     transaction) and PASSED on the data scoreboard's ID — alerts and
     counters are unaffected, frame-level logs remain, the transcript drops
     to ~180 KB, and wall time drops ~33%.
+
+11. **The egress MAC transmits nothing without TX control words — found
+    only by pushing real traffic.** The first full-BD traffic run failed
+    with a distinctive signature: `BYTES_IN` froze at 32,753 (the packet
+    FIFO's 32 KB, full and backpressuring) while `FRAMES_OUT`/`BYTES_OUT`
+    stayed 0 — the RX path (promiscuous filter, FCS strip, error drops)
+    worked perfectly, but the egress MAC never raised `tready`. Root
+    cause: the AXI Ethernet buffer's TX engine pairs each `s_axis_txd`
+    frame with a **6-word control packet on `s_axis_txc`** (flag word
+    `0xA0000000`, app words zero), and the BD had left `s_axis_txc`
+    unconnected as a documented §2.3 scoping decision. Neither synthesis
+    nor the datapath test (which replaces the MACs with VVCs) nor the
+    bring-up test (no traffic) could catch it — only end-to-end frames
+    did, which is precisely the argument for the traffic test's
+    existence. Fix: export `s_axis_txc` at the BD boundary and drive it
+    from an OSVVM `AxiStreamTransmitter` VVC, one null-offload control
+    packet per clean frame (corrupted frames are dropped at ingress and
+    must not get one). Lesson twice over: the failing run also burned
+    ~an hour of wall time idling a 40 ms flat timeout at wire speed —
+    replaced with a progress-based wait (2 ms without a new frame =
+    stall) that fails in minutes, not hours.
 
 ---
 
@@ -1304,5 +1527,6 @@ Expected: synthesis ends with `Build complete! Synthesis passed`; each
 datapath simulation ends with `DONE PASSED TbEthernetFifo_FrameLoopback`
 (hundreds of thousands of affirmations checked), 100% on all four coverage
 models, and the Frame_Stats counters verified over AXI4-Lite; each full-BD
-simulation ends with `DONE PASSED TbFullBd_FullBringup` with both SGMII
-links up and the jumbo bits verified.
+simulation ends with `DONE PASSED TbFullBd_FullTraffic`: all three SGMII
+links up, the corrupted wire frames dropped by the ingress MAC, every
+clean frame delivered byte-identical, and Frame_Stats matching wire truth.
