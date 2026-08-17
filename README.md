@@ -44,8 +44,8 @@ There are **two simulation modes**, each available on both simulators:
 | OSVVM | OsvvmLibraries 2026.05 (`2494959`, recursive submodules) |
 | open-logic | 4.6.0 (`ecca8af`) — `olo_axi_lite_slave` inside the Frame_Stats block |
 | Frame sizes | 64 B – 9018 B (9000-byte-payload jumbo), MAC jumbo support enabled |
-| Questa result | **PASSED** — 403 frames, 945,639 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~15 s turnaround |
-| XSim result | **PASSED** — 403 frames, 902,859 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~87 s turnaround (§5.3) |
+| Questa result | **PASSED** — 403 frames, 945,639 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~16 s turnaround |
+| XSim result | **PASSED** — 403 frames, 902,859 affirmations, 100% coverage incl. jumbo bins, CSR counters verified, ~83 s turnaround (§5.3) |
 | Full-BD sim (`--full_sim`) | **PASSED** on both simulators — entire BD incl. GT SecureIP: links up, then 40 wire frames through PHY partner → MACs → FIFO, corrupted frames dropped, Frame_Stats matches wire truth (§5.4) |
 
 The design targets the Alinx AXAU15 board's FPGA part but is intended for
@@ -400,18 +400,24 @@ what each mode simulates:
 
 | BD block | Datapath test (default) | Full BD (`--full_sim`) |
 |---|---|---|
-| `Axis_Frame_Fifo` | **Simulated — the exact BD instance** (Vivado-generated netlist `Top_Axis_Frame_Fifo_0.v` + fifo_generator behavioral model), under maximum frame stress | Simulated, but **functionally idle** — the client AXIS interfaces are internal to the BD (§2.3), so no frames flow |
-| `Frame_Stats` | **Simulated — source-identical RTL** (`rtl/frame_stats.vhd` + open-logic, the same sources the BD module reference consumes), counters cross-checked against ~1M-check traffic | Simulated (the BD's own instance), exercised over `s_axi_stats` (MAGIC, register dump, counters-zero) |
-| `Ethernet_MAC_Ingress` | Not simulated — `AxiStreamTransmitter` VVC stands in at its `m_axis_rxd` client interface | **Simulated in full**: Ethernet buffer, TEMAC (registers + MDIO over `s_axi_ingress`), SGMII PCS/PMA, GT SecureIP (link up over serial loopback) |
-| `Ethernet_MAC_Egress` | Not simulated — `AxiStreamReceiver` VVC stands in at its `s_axis_txd` client interface | **Simulated in full**: same hierarchy, via `s_axi_egress` and the other serial lane pair |
+| `Axis_Frame_Fifo` | **Simulated — the exact BD instance** (Vivado-generated netlist `Top_Axis_Frame_Fifo_0.v` + fifo_generator behavioral model), under maximum frame stress: ~10⁶ byte checks per run | Simulated and **carrying real traffic** — every frame the ingress MAC accepts crosses it on the way to the egress MAC (33 of 40 sent, in the run shown in §3.5) |
+| `Frame_Stats` | **Simulated — source-identical RTL** (`rtl/frame_stats.vhd` + open-logic, the same sources the BD module reference consumes), counters cross-checked against the testbench's own accounting | Simulated (the BD's own instance): counters read over `s_axi_stats` and **reconciled against wire truth** — the frames and client bytes that survived the MAC's FCS filtering |
+| `Ethernet_MAC_Ingress` | Not simulated — `AxiStreamTransmitter` VVC stands in at its `m_axis_rxd` client interface | **Simulated in full and exercised as a MAC**: TEMAC + Ethernet buffer + SGMII PCS/PMA + GT SecureIP. Brought up over MDIO and `s_axi_ingress` (AN off, jumbo, promiscuous), links up over the serial chain, then **receives wire frames, validates and strips the FCS, and discards the corrupted ones** |
+| `Ethernet_MAC_Egress` | Not simulated — `AxiStreamReceiver` VVC stands in at its `s_axis_txd` client interface | **Simulated in full and exercised as a MAC**: same hierarchy via `s_axi_egress`; **transmits the FIFO's frames back onto the wire, regenerating the FCS**, fed per frame through the exported `s_axis_txc` control stream (§2.3) |
 | `System_Clock` | Not simulated — OSVVM `CreateClock` (125 MHz) replaces it | Simulated (clk_wiz MMCM model, 200 MHz in → 125 MHz + 50 MHz `ref_clk`; the test waits on its `clocks_locked`) |
 | `AXI_Reset` | Not simulated — OSVVM `CreateReset` replaces it | Simulated (proc_sys_reset, sequencing all BD resets) |
 | `signal_detect_const` | Absent (only exists to feed the MACs) | Simulated (xlconstant tie-off) |
 
 The two rows the datapath test simulates are precisely the blocks the
-project **authored or configured**; `--full_sim` covers all seven at
-bring-up intensity. Between the two modes, every block in the BD is
-simulated — and each is stressed by the mode best suited to it.
+project **authored or configured**, and it hammers them: hundreds of
+frames and ~10⁶ checks per run, coverage-driven. `--full_sim` covers all
+seven, but with tens of frames rather than hundreds — enough to prove the
+stack works end to end, at ~65× the simulated cost per frame (§5.3/§5.4:
+28 ms per frame through the FIFO alone, 1.9 s per frame through the full
+MAC-to-MAC path). Between the two
+modes every block in the BD is simulated, each stressed by the mode suited
+to it: **exhaustive data integrity where the project's own logic lives,
+end-to-end integration proof across everything else.**
 
 ### 3.2 Testbench Architecture
 
@@ -977,20 +983,22 @@ caches (OSVVM libraries prebuilt), Xeon Gold 6230R, Ubuntu 24.04, Vivado
 
 | Phase | Questa (`run_sim.sh --batch`) | XSim (`run_sim.tcl`) |
 |---|---|---|
-| Compile + elaborate (+ tool startup) | ~3.6 s | ~66 s |
-| Simulation execution | 11.2 s | 20.3 s |
-| **Total turnaround (warm)** | **14.8 s** | **86.6 s** |
+| Compile + elaborate (+ tool startup) | ~5 s | ~61 s |
+| Simulation execution | 11.4 s | 22.1 s |
+| **Total turnaround (warm)** | **16.3 s** | **83.2 s** |
 | Affirmations checked | 945,639 | 902,859 |
-| Simulated time per wall-second (sim phase) | ~0.40 ms/s | ~0.22 ms/s |
+| Simulated time per wall-second (sim phase) | ~0.39 ms/s | ~0.20 ms/s |
 
 Breaking this down:
 
-* **Raw simulation speed differs by ~2×** (0.40 vs 0.22 simulated
+* **Raw simulation speed differs by ~2×** (0.39 vs 0.20 simulated
   ms per wall-second) — significant but not decisive for a test this size.
-* **The turnaround gap (~6×) is mostly front-end.** Questa's
-  vcom/vopt incremental compile of the changed testbench takes ~3.6 s;
+  Per frame that is ~28 ms of wall clock on Questa, the figure §3.1 uses
+  to contrast the two modes.
+* **The turnaround gap (~5×) is mostly front-end.** Questa's
+  vcom/vopt incremental compile of the changed testbench takes ~5 s;
   XSim re-runs xvhdl over the sources and a full `xelab` elaboration
-  (~66 s including Vivado's TCL shell startup) on every invocation. For
+  (~61 s including Vivado's TCL shell startup) on every invocation. For
   edit–run–debug iteration that fixed cost dominates, which is why Questa
   is this project's primary flow and XSim the portability check.
 * The workloads are near-identical but not byte-identical: each simulator
